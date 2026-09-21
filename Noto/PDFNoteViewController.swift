@@ -15,9 +15,11 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
     // The controller is the picker's responder, so the palette stays up while canvases come and go.
     override var canBecomeFirstResponder: Bool { true }
 
+    private let document: PDFDocument
+
     init(document: PDFDocument) {
+        self.document = document
         super.init(nibName: nil, bundle: nil)
-        pdfView.document = document
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -30,7 +32,10 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
         pdfView.displayMode = .singlePageContinuous
         pdfView.displayDirection = .vertical
         pdfView.autoScales = true
-        pdfView.pageOverlayViewProvider = self
+        pdfView.usePageViewController(false)
+        pdfView.isInMarkupMode = true // lets touches reach the overlay canvases instead of PDFView's own gestures
+        pdfView.pageOverlayViewProvider = self // must be set before the document
+        pdfView.document = document
         view.addSubview(pdfView)
 
         currentTool = toolPicker.selectedTool
@@ -55,7 +60,7 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
         if let existing = canvases[page] { return existing }
         let canvas = PKCanvasView()
         canvas.drawingPolicy = .pencilOnly
-        canvas.backgroundColor = .clear
+        canvas.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.08) // debug: shows the overlay exists, back to .clear later
         canvas.isOpaque = false
         canvas.isScrollEnabled = false
         canvas.overrideUserInterfaceStyle = .light // ink is drawn on white paper in both modes
@@ -63,6 +68,11 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
         canvas.drawing = drawings[page] ?? PKDrawing()
         canvases[page] = canvas
         return canvas
+    }
+
+    func pdfView(_ pdfView: PDFView, willDisplayOverlayView overlayView: UIView, for page: PDFPage) {
+        // PDFKit turns interaction off on its page views, which would swallow touches meant for the canvas.
+        overlayView.superview?.isUserInteractionEnabled = true
     }
 
     func pdfView(_ pdfView: PDFView, willEndDisplayingOverlayView overlayView: UIView, for page: PDFPage) {
