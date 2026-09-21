@@ -3,46 +3,40 @@ import PDFKit
 import PencilKit
 import SwiftUI
 
-// The canvases' delegate must not be the view controller: PKCanvasView is a UIScrollView and asks its delegate
-// for viewForZooming, which must stay PencilKit's own and not the page container below.
-private final class InkDelegate: NSObject, PKCanvasViewDelegate {
-    var onChange: ((PKCanvasView) -> Void)?
-
-    func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-        onChange?(canvasView)
-    }
-}
-
 // Own page viewer: a vertical stack of pages inside a UIScrollView.
-// Pinch zoom is baked in when the gesture ends (pages are re-laid-out at the new size with zoomScale back at 1),
-// so both the PDF tiles and the ink are rendered at the real display size rather than scaled up.
-final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToolPickerObserver {
+// Pinch zoom is handled here, not by the scroll view: while the fingers are down the page container is just
+// scaled (fast, briefly soft); on release the pages are laid out at the new size and the PDF tiles redraw sharp.
+// Ink is vector, so it stays sharp throughout. PencilKit is only used for its tool palette.
+final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, UIGestureRecognizerDelegate, PKToolPickerObserver {
+    private struct PinchState {
+        var focal: CGPoint // point of the content under the fingers when the pinch began
+        var screen: CGPoint // where the fingers are now, in this controller's view
+        var scale = CGFloat(1) // zoom change since the pinch began
+    }
+
     private let folder: DocumentFolder
     private let document: PDFDocument // keeps the CGPDFPages alive
     private let pages: [CGPDFPage]
     private let pageSizes: [CGSize] // displayed size in PDF points
+    private let store: InkStore
 
     private let scrollView = UIScrollView()
     private let contentView = UIView()
     private let toolPicker = PKToolPicker()
-    private let inkDelegate = InkDelegate()
 
     private var frames: [CGRect] = []
     private var live: [Int: PageView] = [:]
     private var zoom: CGFloat = 1
     private var laidOutWidth: CGFloat = 0
-    private var isBaking = false
+    private var pinch: PinchState?
     private let maxZoom: CGFloat = 4
     private let margin: CGFloat = 12 // page gap and side margin at zoom 1; scales with zoom
 
+    private var mode: InkMode = .none
+    private var saveAlertShown = false
+
     private let previews = NSCache<NSNumber, UIImage>()
     private let previewQueue = DispatchQueue(label: "noto.preview", qos: .userInitiated)
-
-    private var drawings: [Int: PKDrawing] = [:]
-    private var dirty: Set<Int> = []
-    private var saveTimer: Timer?
-    private var saveAlertShown = false
-    private var currentTool: PKTool = PKInkingTool(.pen, color: .black, width: 4)
 
     // The controller is the picker's responder, so the palette stays up while pages come and go.
     override var canBecomeFirstResponder: Bool { true }
@@ -51,6 +45,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         self.folder = folder
         self.document = document
         self.pages = pages
+        self.store = InkStore(folder: folder)
         self.pageSizes = pages.map { page in
             let box = page.getBoxRect(.cropBox)
             let rotated = page.rotationAngle % 180 != 0
@@ -59,6 +54,9 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         }
         super.init(nibName: nil, bundle: nil)
         previews.totalCostLimit = 120_000_000
+        store.undoManager = { [weak self] in self?.undoManager }
+        store.onChange = { [weak self] page in self?.live[page]?.ink.sync() }
+        store.onSaveError = { [weak self] error in self?.reportSaveFailure(error) }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -72,15 +70,18 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         scrollView.delegate = self
         scrollView.contentInsetAdjustmentBehavior = .never
         scrollView.delaysContentTouches = false
-        scrollView.bouncesZoom = true
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.panGestureRecognizer.allowedTouchTypes = fingers // the pencil only draws
-        scrollView.pinchGestureRecognizer?.allowedTouchTypes = fingers
+        contentView.layer.anchorPoint = .zero // scale about the top-left corner while pinching
         scrollView.addSubview(contentView)
         view.addSubview(scrollView)
 
-        inkDelegate.onChange = { [weak self] canvas in self?.inkChanged(canvas) }
-        currentTool = toolPicker.selectedTool
+        let pinchRecognizer = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        pinchRecognizer.allowedTouchTypes = fingers
+        pinchRecognizer.delegate = self
+        scrollView.addGestureRecognizer(pinchRecognizer)
+
+        apply(toolPicker.selectedTool)
         toolPicker.addObserver(self)
         toolPicker.setVisible(true, forFirstResponder: self)
         NotificationCenter.default.addObserver(self, selector: #selector(flush), name: UIApplication.willResignActiveNotification, object: nil)
@@ -98,18 +99,21 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         resignFirstResponder()
     }
 
+    @objc private func flush() {
+        store.flush()
+    }
+
     // MARK: Layout
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let width = scrollView.bounds.width
-        guard width > 0, width != laidOutWidth else { return }
+        guard width > 0, width != laidOutWidth, pinch == nil else { return }
         let anchor = anchorAtTop()
         let oldWidth = scrollView.contentSize.width
         let oldX = scrollView.contentOffset.x
         laidOutWidth = width
         relayout()
-        updateZoomBounds()
         if let anchor {
             let frame = frames[anchor.index]
             let x = oldWidth > 0 ? oldX / oldWidth * scrollView.contentSize.width : 0
@@ -118,7 +122,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         layoutVisiblePages()
     }
 
-    // Layout at zoom z is exactly the layout at zoom 1 scaled by z, so baking a pinch causes no visible jump.
+    // Layout at zoom z is exactly the layout at zoom 1 scaled by z, so committing a pinch causes no jump.
     private func relayout() {
         let width = scrollView.bounds.width
         let gap = margin * zoom
@@ -133,11 +137,6 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         contentView.frame = CGRect(origin: .zero, size: content)
         scrollView.contentSize = content
         for (index, view) in live { view.frame = frames[index] }
-    }
-
-    private func updateZoomBounds() {
-        scrollView.minimumZoomScale = 1 / zoom
-        scrollView.maximumZoomScale = maxZoom / zoom
     }
 
     private func clamped(_ offset: CGPoint) -> CGPoint {
@@ -168,22 +167,17 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     }
 
     private func show(_ index: Int) {
-        let view = PageView(page: pages[index], pageSize: pageSizes[index])
+        let view = PageView(page: pages[index], pageSize: pageSizes[index], index: index, store: store)
         view.frame = frames[index]
-        view.canvas.tool = currentTool
-        view.canvas.drawing = drawing(for: index)
-        view.canvas.delegate = inkDelegate
+        view.ink.mode = mode
         contentView.addSubview(view)
         live[index] = view
         loadPreview(for: index, into: view)
     }
 
     private func retire(_ index: Int) {
-        guard let view = live[index] else { return }
-        drawings[index] = view.canvas.drawing
-        view.removeFromSuperview()
+        live[index]?.removeFromSuperview()
         live[index] = nil
-        flush()
     }
 
     private func loadPreview(for index: Int, into view: PageView) {
@@ -203,70 +197,61 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         }
     }
 
-    // MARK: UIScrollViewDelegate
-
-    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
-        scrollView === self.scrollView ? contentView : nil
-    }
+    // MARK: Scrolling and pinching
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard scrollView === self.scrollView, !isBaking, scrollView.zoomScale == 1 else { return }
+        guard pinch == nil else { return }
         layoutVisiblePages()
     }
 
-    func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
-        guard scrollView === self.scrollView, abs(scale - 1) > 0.01 else { return }
-        let offset = scrollView.contentOffset
-        isBaking = true
-        zoom = min(max(zoom * scale, 1), maxZoom)
-        scrollView.zoomScale = 1
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        true
+    }
+
+    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            pinch = PinchState(focal: gesture.location(in: contentView), screen: gesture.location(in: view))
+            scrollView.panGestureRecognizer.isEnabled = false // the pinch moves the content itself
+        case .changed:
+            guard var state = pinch else { return }
+            state.scale = min(max(zoom * gesture.scale, 1), maxZoom) / zoom
+            state.screen = gesture.location(in: view)
+            pinch = state
+            let base = contentView.bounds.size
+            contentView.transform = CGAffineTransform(scaleX: state.scale, y: state.scale)
+            scrollView.contentSize = CGSize(width: base.width * state.scale, height: base.height * state.scale)
+            scrollView.contentOffset = clamped(offset(for: state))
+        case .ended, .cancelled, .failed:
+            scrollView.panGestureRecognizer.isEnabled = true
+            commitPinch()
+        default:
+            break
+        }
+    }
+
+    // Keeps the point that was under the fingers under the fingers.
+    private func offset(for state: PinchState) -> CGPoint {
+        CGPoint(x: state.focal.x * state.scale - state.screen.x, y: state.focal.y * state.scale - state.screen.y)
+    }
+
+    private func commitPinch() {
+        guard let state = pinch else { return }
+        pinch = nil
+        guard abs(state.scale - 1) > 0.005 else {
+            contentView.transform = .identity
+            scrollView.contentSize = contentView.bounds.size
+            return
+        }
+        live.values.forEach { $0.freezeTile() }
+        contentView.transform = .identity
+        zoom *= state.scale
         relayout()
-        scrollView.contentOffset = clamped(offset)
-        updateZoomBounds()
-        isBaking = false
+        scrollView.contentOffset = clamped(offset(for: state))
         layoutVisiblePages()
     }
 
-    // MARK: Storage
-
-    private func drawing(for index: Int) -> PKDrawing {
-        if let cached = drawings[index] { return cached }
-        let url = folder.drawingURL(page: index)
-        var loaded = PKDrawing()
-        if let data = try? Data(contentsOf: url) {
-            if let decoded = try? PKDrawing(data: data) {
-                loaded = decoded
-            } else {
-                // Keep an unreadable file instead of overwriting it with the next save.
-                try? FileManager.default.moveItem(at: url, to: url.appendingPathExtension("corrupt"))
-            }
-        }
-        drawings[index] = loaded
-        return loaded
-    }
-
-    private func inkChanged(_ canvas: PKCanvasView) {
-        guard let index = live.first(where: { $0.value.canvas === canvas })?.key else { return }
-        drawings[index] = canvas.drawing
-        dirty.insert(index)
-        saveTimer?.invalidate()
-        saveTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { [weak self] _ in self?.flush() }
-    }
-
-    @objc private func flush() {
-        saveTimer?.invalidate()
-        saveTimer = nil
-        for index in dirty {
-            let drawing = live[index]?.canvas.drawing ?? drawings[index] ?? PKDrawing()
-            do {
-                try drawing.dataRepresentation().write(to: folder.drawingURL(page: index), options: .atomic)
-                dirty.remove(index)
-            } catch {
-                reportSaveFailure(error) // stays dirty, so the next flush retries
-                return
-            }
-        }
-    }
+    // MARK: Errors
 
     private func reportSaveFailure(_ error: Error) {
         guard !saveAlertShown, presentedViewController == nil, viewIfLoaded?.window != nil else { return }
@@ -276,11 +261,32 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         present(alert, animated: true)
     }
 
-    // MARK: PKToolPickerObserver
+    // MARK: Tools (PencilKit's palette is only the UI; the engine draws)
 
+    // Widths from the palette are in PencilKit's units, scaled here to page points. Tune by feel.
     private func apply(_ tool: PKTool) {
-        currentTool = tool
-        live.values.forEach { $0.canvas.tool = tool }
+        switch tool {
+        case let ink as PKInkingTool:
+            var color = Self.rgba(ink.color)
+            if ink.inkType == .marker {
+                color[3] *= 0.35
+                mode = .draw(kind: .highlighter, color: color, width: max(Float(ink.width) * 0.75, 1))
+            } else {
+                mode = .draw(kind: .pen, color: color, width: max(Float(ink.width) * 0.5, 0.5))
+            }
+        case is PKEraserTool:
+            mode = .erase
+        default:
+            mode = .none // lasso and ruler are not built yet
+        }
+        live.values.forEach { $0.ink.mode = mode }
+    }
+
+    // Pages are white paper, so colors are resolved for light mode.
+    private static func rgba(_ color: UIColor) -> [Float] {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .light)).getRed(&r, green: &g, blue: &b, alpha: &a)
+        return [Float(r), Float(g), Float(b), Float(a)]
     }
 
     func toolPickerSelectedToolDidChange(_ toolPicker: PKToolPicker) {

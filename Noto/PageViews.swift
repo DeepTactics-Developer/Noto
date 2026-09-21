@@ -1,5 +1,4 @@
 import UIKit
-import PencilKit
 
 enum PDFRenderer {
     // Tiles and previews draw on background threads and CGPDFPage drawing is not documented as thread safe.
@@ -61,32 +60,22 @@ final class PDFTileView: UIView {
     }
 }
 
-// One page: preview, sharp PDF tiles, and a PencilKit canvas on top.
-// The canvas is zoomed to the page's display width (as in Apple's PencilKit sample), so strokes are
-// re-rendered at the real size instead of being stretched, and drawing coordinates stay in page points.
+// One page, bottom to top: low-res preview, sharp PDF tiles, ink.
 final class PageView: UIView {
-    let canvas = PKCanvasView()
+    let ink: InkPageView
     private let preview = UIImageView()
     private let tile: PDFTileView
-    private let pageSize: CGSize
-    private var fittedWidth: CGFloat = 0
+    private var snapshot: UIView?
 
-    init(page: CGPDFPage, pageSize: CGSize) {
+    init(page: CGPDFPage, pageSize: CGSize, index: Int, store: InkStore) {
         tile = PDFTileView(page: page)
-        self.pageSize = pageSize
+        ink = InkPageView(page: index, pageSize: pageSize, store: store)
         super.init(frame: .zero)
         backgroundColor = .white
         preview.contentMode = .scaleToFill
         addSubview(preview)
         addSubview(tile)
-        addSubview(canvas)
-        canvas.drawingPolicy = .pencilOnly
-        canvas.backgroundColor = .clear
-        canvas.isOpaque = false
-        canvas.isScrollEnabled = false
-        canvas.contentInsetAdjustmentBehavior = .never
-        canvas.pinchGestureRecognizer?.isEnabled = false
-        canvas.overrideUserInterfaceStyle = .light // ink is drawn on white paper in both modes
+        addSubview(ink)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -95,20 +84,26 @@ final class PageView: UIView {
         preview.image = image
     }
 
+    // Call right before the page is resized: keeps a picture of the old tiles underneath, stretched to the
+    // new size, until the freshly drawn tiles cover it.
+    func freezeTile() {
+        snapshot?.removeFromSuperview()
+        snapshot = nil
+        guard bounds.width > 0, let picture = tile.snapshotView(afterScreenUpdates: false) else { return }
+        insertSubview(picture, belowSubview: tile)
+        snapshot = picture
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self, weak picture] in
+            guard let picture, self?.snapshot === picture else { return }
+            picture.removeFromSuperview()
+            self?.snapshot = nil
+        }
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         preview.frame = bounds
+        snapshot?.frame = bounds
         tile.frame = bounds
-        canvas.frame = bounds
-        guard bounds.width > 0, bounds.width != fittedWidth else { return }
-        fittedWidth = bounds.width
-        let scale = bounds.width / pageSize.width
-        canvas.minimumZoomScale = min(canvas.minimumZoomScale, scale)
-        canvas.maximumZoomScale = max(canvas.maximumZoomScale, scale)
-        canvas.zoomScale = scale
-        canvas.minimumZoomScale = scale
-        canvas.maximumZoomScale = scale
-        canvas.contentSize = CGSize(width: pageSize.width * scale, height: pageSize.height * scale)
-        canvas.contentOffset = .zero
+        ink.frame = bounds
     }
 }

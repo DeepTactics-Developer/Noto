@@ -2,7 +2,7 @@ import Foundation
 import PDFKit
 
 // One folder per document in the app's Documents directory:
-//   source.pdf, title.txt, p<index>.drawing (one PKDrawing per page, in page coordinates)
+//   source.pdf, title.txt, p<index>.ink (one InkPageFile per page, strokes in page coordinates)
 struct DocumentFolder: Identifiable, Hashable {
     let url: URL
     let title: String
@@ -10,7 +10,7 @@ struct DocumentFolder: Identifiable, Hashable {
 
     var id: String { url.lastPathComponent }
     var pdfURL: URL { url.appending(path: "source.pdf") }
-    func drawingURL(page: Int) -> URL { url.appending(path: "p\(page).drawing") }
+    func inkURL(page: Int) -> URL { url.appending(path: "p\(page).ink") }
 }
 
 struct NotAPDF: LocalizedError {
