@@ -240,10 +240,12 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
                 mode = .draw(kind: .pen, color: color, width: max(Float(ink.width) * 0.5, 0.5))
             }
         case let eraser as PKEraserTool:
+            var radius = CGFloat(AppSettings.eraserSize)
+            if eraser.eraserType == .fixedWidthBitmap { radius = min(max(eraser.width / 2, 4), 60) } // the palette's own size
             switch AppSettings.eraserMode {
-            case .partial: mode = .erase(partial: true)
-            case .stroke: mode = .erase(partial: false)
-            case .palette: mode = .erase(partial: eraser.eraserType != .vector)
+            case .partial: mode = .erase(partial: true, radius: radius)
+            case .stroke: mode = .erase(partial: false, radius: radius)
+            case .palette: mode = .erase(partial: eraser.eraserType != .vector, radius: radius)
             }
         case is PKLassoTool:
             mode = .lasso

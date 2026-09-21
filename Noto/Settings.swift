@@ -24,18 +24,21 @@ enum AppSettings {
         static let pressure = "pressure"
         static let pressureSensitivity = "pressureSensitivity"
         static let eraserMode = "eraserMode"
+        static let eraserSize = "eraserSize"
     }
 
     static var shapeSnap: Bool { UserDefaults.standard.object(forKey: Key.shapeSnap) as? Bool ?? true }
     static var holdDelay: Double { UserDefaults.standard.object(forKey: Key.holdDelay) as? Double ?? 0.5 }
     static var pressure: Bool { UserDefaults.standard.object(forKey: Key.pressure) as? Bool ?? true }
-    static var pressureSensitivity: Double { UserDefaults.standard.object(forKey: Key.pressureSensitivity) as? Double ?? 0.5 }
+    static var pressureSensitivity: Double { UserDefaults.standard.object(forKey: Key.pressureSensitivity) as? Double ?? 0.6 }
     static var eraserMode: EraserMode { EraserMode(rawValue: UserDefaults.standard.string(forKey: Key.eraserMode) ?? "") ?? .partial }
+    static var eraserSize: Double { UserDefaults.standard.object(forKey: Key.eraserSize) as? Double ?? 12 } // radius in screen points
 }
 
 struct SettingsView: View {
     @AppStorage(AppSettings.Key.pressure) private var pressure = true
-    @AppStorage(AppSettings.Key.pressureSensitivity) private var sensitivity = 0.5
+    @AppStorage(AppSettings.Key.pressureSensitivity) private var sensitivity = 0.6
+    @AppStorage(AppSettings.Key.eraserSize) private var eraserSize = 12.0
     @AppStorage(AppSettings.Key.shapeSnap) private var shapeSnap = true
     @AppStorage(AppSettings.Key.holdDelay) private var holdDelay = 0.5
     @AppStorage(AppSettings.Key.eraserMode) private var eraser = EraserMode.partial.rawValue
@@ -75,10 +78,14 @@ struct SettingsView: View {
                     }
                     .pickerStyle(.inline)
                     .labelsHidden()
+                    VStack(alignment: .leading) {
+                        Text("지우개 크기 \(Int(eraserSize))")
+                        Slider(value: $eraserSize, in: 4...40, step: 1)
+                    }
                 } header: {
                     Text("지우개")
                 } footer: {
-                    Text("부분 지우개는 지우개가 닿은 부분만, 획 지우개는 닿은 획 전체를 지웁니다.")
+                    Text("부분 지우개는 지우개가 닿은 부분만, 획 지우개는 닿은 획 전체를 지웁니다. 지우개를 대고 있는 동안 범위가 원으로 표시됩니다. 팔레트에서 고정 폭 지우개를 고르면 팔레트의 크기를 따릅니다.")
                 }
             }
             .navigationTitle("설정")

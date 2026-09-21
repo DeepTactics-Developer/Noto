@@ -64,6 +64,20 @@ final class InkTests: XCTestCase {
         XCTAssertEqual(pieces[0].pressure, 0.7)
     }
 
+    // Normalized force in ordinary writing is roughly 0.05...0.4 of the pencil's maximum; the width has to
+    // visibly follow that whole range, or the pressure setting looks like it does nothing.
+    func testWidthFollowsTheForceOfOrdinaryWriting() {
+        let light = InkGeometry.widthFactor(force: 0.05, pressure: 0.6)
+        let medium = InkGeometry.widthFactor(force: 0.16, pressure: 0.6)
+        let firm = InkGeometry.widthFactor(force: 0.4, pressure: 0.6)
+        XCTAssertLessThan(light, medium)
+        XCTAssertLessThan(medium, firm)
+        XCTAssertGreaterThan(firm / light, 2) // at least twice as wide when pressing firmly
+        XCTAssertEqual(medium, 1, accuracy: 0.15) // a medium touch stays near the base width
+        XCTAssertEqual(InkGeometry.widthFactor(force: 0.4, pressure: 0), 1 + 0 * 2 * (1 - 0.4)) // no sensitivity: unchanged
+        XCTAssertGreaterThanOrEqual(InkGeometry.widthFactor(force: 0, pressure: 1), 0.25) // never vanishes
+    }
+
     func testNoPressureGivesOneRun() {
         let points = (0..<20).map { InkPoint(x: Float($0), y: 0, force: Float($0) / 20, time: 0) }
         XCTAssertEqual(InkGeometry.runs(of: points, width: 4, pressure: 0).count, 1)

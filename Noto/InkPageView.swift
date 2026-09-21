@@ -3,7 +3,7 @@ import UIKit
 enum InkMode {
     case none
     case draw(kind: InkKind, color: [Float], width: Float)
-    case erase(partial: Bool)
+    case erase(partial: Bool, radius: CGFloat) // radius in screen points
     case lasso
 }
 
@@ -69,7 +69,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
 
     private enum Gesture {
         case drawing
-        case erasing(partial: Bool)
+        case erasing(partial: Bool, radius: CGFloat)
         case lassoing
         case moving
     }
@@ -102,6 +102,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private let holdSlop: CGFloat = 3 // screen points the pen may wander and still count as held
 
     // erasing
+    private let eraserCursor = NoActionShapeLayer() // circle showing the eraser's reach while the pen is down
     private var eraseRemoved: [UUID: InkStroke] = [:] // strokes that existed before this eraser drag and are now gone
     private var eraseAdded: [UUID: InkStroke] = [:] // pieces created during this drag that are still there
 
@@ -136,6 +137,10 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
             layer.lineDashPattern = [5, 4]
             layer.lineJoin = .round
         }
+
+        eraserCursor.frame = CGRect(origin: .zero, size: pageSize)
+        eraserCursor.strokeColor = UIColor.systemGray.cgColor
+        eraserCursor.fillColor = UIColor.systemGray.withAlphaComponent(0.15).cgColor
 
         let menu = UIEditMenuInteraction(delegate: self)
         addInteraction(menu)
@@ -228,12 +233,13 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
             activeTouch = touch
             gesture = .drawing
             beginStroke(touch, kind: kind, color: color, width: width)
-        case .erase(let partial):
+        case .erase(let partial, let radius):
             activeTouch = touch
-            gesture = .erasing(partial: partial)
+            gesture = .erasing(partial: partial, radius: radius)
             eraseRemoved = [:]
             eraseAdded = [:]
-            erase(at: pagePoint(of: touch), partial: partial)
+            erase(at: pagePoint(of: touch), partial: partial, radius: radius)
+            moveEraserCursor(to: pagePoint(of: touch), radius: radius)
         case .lasso:
             activeTouch = touch
             let p = pagePoint(of: touch)
@@ -260,8 +266,9 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         switch gesture {
         case .drawing:
             moveStroke(touch, event: event, samples: samples)
-        case .erasing(let partial):
-            samples.forEach { erase(at: pagePoint(of: $0), partial: partial) }
+        case .erasing(let partial, let radius):
+            samples.forEach { erase(at: pagePoint(of: $0), partial: partial, radius: radius) }
+            moveEraserCursor(to: pagePoint(of: touch), radius: radius)
         case .lassoing:
             lassoPoints += samples.map(pagePoint)
             updateLassoPath()
@@ -441,8 +448,8 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     // MARK: Eraser
 
     // Partial: strokes are cut where the eraser circle passes. Whole: every stroke it touches goes.
-    private func erase(at point: CGPoint, partial: Bool) {
-        let radius = 10 / screenPerPagePoint // 10 screen points, whatever the zoom
+    private func erase(at point: CGPoint, partial: Bool, radius screenRadius: CGFloat) {
+        let radius = screenRadius / screenPerPagePoint // the same size on screen, whatever the zoom
         var removeIDs = Set<UUID>()
         var pieces: [InkStroke] = []
         for stroke in store.strokes(on: page) {
@@ -462,7 +469,17 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         for piece in pieces { eraseAdded[piece.id] = piece }
     }
 
+    private func moveEraserCursor(to point: CGPoint, radius screenRadius: CGFloat) {
+        let r = screenRadius / screenPerPagePoint
+        withoutAnimation {
+            eraserCursor.lineWidth = 1 / screenPerPagePoint
+            eraserCursor.path = CGPath(ellipseIn: CGRect(x: point.x - r, y: point.y - r, width: 2 * r, height: 2 * r), transform: nil)
+            if eraserCursor.superlayer == nil { host.layer.addSublayer(eraserCursor) }
+        }
+    }
+
     private func endErase() {
+        withoutAnimation { eraserCursor.removeFromSuperlayer() }
         guard !eraseRemoved.isEmpty || !eraseAdded.isEmpty else { return }
         store.commitErase(removed: Array(eraseRemoved.values), added: Array(eraseAdded.values), on: page)
         eraseRemoved = [:]

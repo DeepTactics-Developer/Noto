@@ -125,6 +125,14 @@ enum InkGeometry {
         return path
     }
 
+    // How much wider or thinner than the base width a point is drawn. Force is stored as a fraction of the pencil's
+    // maximum and ordinary writing stays below about 40% of it, so 40% counts as "firm". A light touch draws thinner,
+    // a firm one thicker; `pressure` (the sensitivity setting) scales the effect. 1 at a medium touch.
+    static func widthFactor(force: Float, pressure: Float) -> CGFloat {
+        let firm = min(max(CGFloat(force) / 0.4, 0), 1)
+        return max(0.25, 1 + CGFloat(pressure) * 2 * (firm - 0.4))
+    }
+
     // Splits a stroke into runs of one width each. Force is averaged over five samples and the width only steps
     // when it has really moved, so pen jitter does not chop the stroke into many runs. Neighbouring runs share a point.
     static func runs(of points: [InkPoint], width: Float, pressure: Float) -> [InkRun] {
@@ -135,8 +143,7 @@ enum InkGeometry {
             return points[lo...hi].reduce(0) { $0 + $1.force } / Float(hi - lo + 1)
         }
         func levels(_ i: Int) -> CGFloat {
-            let factor = max(0.2, 1 + CGFloat(pressure) * (CGFloat(smooth[i]) - 0.5))
-            return factor * CGFloat(width) / step
+            widthFactor(force: smooth[i], pressure: pressure) * CGFloat(width) / step
         }
         var runs: [InkRun] = []
         var current = [points[0]]
