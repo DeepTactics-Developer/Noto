@@ -9,7 +9,7 @@ jobs:
   simulator:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain info
         run: |
           xcodebuild -version
