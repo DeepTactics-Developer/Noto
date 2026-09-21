@@ -1,0 +1,25 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  simulator:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios
+          ls /Applications | grep -i xcode
+      - run: brew install xcodegen
+      - run: xcodegen generate
+      - name: Build for simulator
+        run: |
+          xcodebuild build \
+            -project Noto.xcodeproj -scheme Noto \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO
