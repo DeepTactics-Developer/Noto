@@ -3,10 +3,20 @@ import PDFKit
 import PencilKit
 import SwiftUI
 
+// The canvases' delegate must not be the view controller: PKCanvasView is a UIScrollView and asks its delegate
+// for viewForZooming, which must stay PencilKit's own and not the page container below.
+private final class InkDelegate: NSObject, PKCanvasViewDelegate {
+    var onChange: ((PKCanvasView) -> Void)?
+
+    func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+        onChange?(canvasView)
+    }
+}
+
 // Own page viewer: a vertical stack of pages inside a UIScrollView.
 // Pinch zoom is baked in when the gesture ends (pages are re-laid-out at the new size with zoomScale back at 1),
 // so both the PDF tiles and the ink are rendered at the real display size rather than scaled up.
-final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToolPickerObserver, PKCanvasViewDelegate {
+final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToolPickerObserver {
     private let folder: DocumentFolder
     private let document: PDFDocument // keeps the CGPDFPages alive
     private let pages: [CGPDFPage]
@@ -15,6 +25,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     private let scrollView = UIScrollView()
     private let contentView = UIView()
     private let toolPicker = PKToolPicker()
+    private let inkDelegate = InkDelegate()
 
     private var frames: [CGRect] = []
     private var live: [Int: PageView] = [:]
@@ -23,6 +34,9 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     private var isBaking = false
     private let maxZoom: CGFloat = 4
     private let margin: CGFloat = 12 // page gap and side margin at zoom 1; scales with zoom
+
+    private let previews = NSCache<NSNumber, UIImage>()
+    private let previewQueue = DispatchQueue(label: "noto.preview", qos: .userInitiated)
 
     private var drawings: [Int: PKDrawing] = [:]
     private var dirty: Set<Int> = []
@@ -44,6 +58,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
             return size.width > 0 && size.height > 0 ? size : CGSize(width: 612, height: 792)
         }
         super.init(nibName: nil, bundle: nil)
+        previews.totalCostLimit = 120_000_000
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -64,6 +79,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         scrollView.addSubview(contentView)
         view.addSubview(scrollView)
 
+        inkDelegate.onChange = { [weak self] canvas in self?.inkChanged(canvas) }
         currentTool = toolPicker.selectedTool
         toolPicker.addObserver(self)
         toolPicker.setVisible(true, forFirstResponder: self)
@@ -138,14 +154,17 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         return (index, frame.height > 0 ? (y - frame.minY) / frame.height : 0)
     }
 
-    // Only pages within about a screen of the viewport get views; the rest are released.
+    // Pages within a couple of screens of the viewport get views; they are only released once well outside
+    // that, so scrolling back and forth does not rebuild them.
     private func layoutVisiblePages() {
         guard !frames.isEmpty else { return }
-        let top = scrollView.contentOffset.y - scrollView.bounds.height
-        let bottom = scrollView.contentOffset.y + scrollView.bounds.height * 2
-        let wanted = Set(frames.indices.filter { frames[$0].maxY >= top && frames[$0].minY <= bottom })
-        for index in Array(live.keys) where !wanted.contains(index) { retire(index) }
-        for index in wanted where live[index] == nil { show(index) }
+        let y = scrollView.contentOffset.y
+        let height = scrollView.bounds.height
+        func intersects(_ index: Int, above: CGFloat, below: CGFloat) -> Bool {
+            frames[index].maxY >= y - above && frames[index].minY <= y + height + below
+        }
+        for index in Array(live.keys) where !intersects(index, above: 3 * height, below: 4 * height) { retire(index) }
+        for index in frames.indices where live[index] == nil && intersects(index, above: 1.5 * height, below: 2.5 * height) { show(index) }
     }
 
     private func show(_ index: Int) {
@@ -153,9 +172,10 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         view.frame = frames[index]
         view.canvas.tool = currentTool
         view.canvas.drawing = drawing(for: index)
-        view.canvas.delegate = self
+        view.canvas.delegate = inkDelegate
         contentView.addSubview(view)
         live[index] = view
+        loadPreview(for: index, into: view)
     }
 
     private func retire(_ index: Int) {
@@ -166,17 +186,36 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         flush()
     }
 
+    private func loadPreview(for index: Int, into view: PageView) {
+        let key = NSNumber(value: index)
+        if let cached = previews.object(forKey: key) {
+            view.setPreview(cached)
+            return
+        }
+        let page = pages[index]
+        let size = pageSizes[index]
+        previewQueue.async { [weak self, weak view] in
+            let image = PDFRenderer.preview(of: page, pageSize: size)
+            DispatchQueue.main.async {
+                self?.previews.setObject(image, forKey: key, cost: Int(image.size.width * image.size.height * 4))
+                view?.setPreview(image)
+            }
+        }
+    }
+
     // MARK: UIScrollViewDelegate
 
-    func viewForZooming(in scrollView: UIScrollView) -> UIView? { contentView }
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        scrollView === self.scrollView ? contentView : nil
+    }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard !isBaking, scrollView.zoomScale == 1 else { return }
+        guard scrollView === self.scrollView, !isBaking, scrollView.zoomScale == 1 else { return }
         layoutVisiblePages()
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
-        guard abs(scale - 1) > 0.01 else { return }
+        guard scrollView === self.scrollView, abs(scale - 1) > 0.01 else { return }
         let offset = scrollView.contentOffset
         isBaking = true
         zoom = min(max(zoom * scale, 1), maxZoom)
@@ -206,7 +245,10 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         return loaded
     }
 
-    private func scheduleSave() {
+    private func inkChanged(_ canvas: PKCanvasView) {
+        guard let index = live.first(where: { $0.value.canvas === canvas })?.key else { return }
+        drawings[index] = canvas.drawing
+        dirty.insert(index)
         saveTimer?.invalidate()
         saveTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { [weak self] _ in self?.flush() }
     }
@@ -232,15 +274,6 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         let alert = UIAlertController(title: "필기를 저장하지 못했습니다", message: error.localizedDescription, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "확인", style: .default) { [weak self] _ in self?.saveAlertShown = false })
         present(alert, animated: true)
-    }
-
-    // MARK: PKCanvasViewDelegate
-
-    func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-        guard let index = live.first(where: { $0.value.canvas === canvasView })?.key else { return }
-        drawings[index] = canvasView.drawing
-        dirty.insert(index)
-        scheduleSave()
     }
 
     // MARK: PKToolPickerObserver
