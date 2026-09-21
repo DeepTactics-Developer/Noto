@@ -14,7 +14,16 @@ struct DocumentFolder: Identifiable, Hashable {
 }
 
 struct NotAPDF: LocalizedError {
-    var errorDescription: String? { "파일이 올바른 PDF가 아닙니다." }
+    var errorDescription: String? { "파일이 올바른 PDF가 아니거나 암호가 걸려 있습니다." }
+}
+
+extension PDFDocument {
+    // Every page as a CGPDFPage, or nil for locked, empty or partly unreadable files.
+    var cgPages: [CGPDFPage]? {
+        guard !isLocked, pageCount > 0 else { return nil }
+        let pages = (0..<pageCount).compactMap { page(at: $0)?.pageRef }
+        return pages.count == pageCount ? pages : nil
+    }
 }
 
 enum Library {
@@ -41,7 +50,7 @@ enum Library {
         do {
             let pdf = folder.appending(path: "source.pdf")
             try fm.copyItem(at: source, to: pdf)
-            guard PDFDocument(url: pdf) != nil else { throw NotAPDF() }
+            guard PDFDocument(url: pdf)?.cgPages != nil else { throw NotAPDF() }
             try title.write(to: folder.appending(path: "title.txt"), atomically: true, encoding: .utf8)
         } catch {
             try? fm.removeItem(at: folder)

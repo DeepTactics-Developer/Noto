@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var documents: [DocumentFolder] = []
-    @State private var opened: (folder: DocumentFolder, pdf: PDFDocument)?
+    @State private var opened: (folder: DocumentFolder, pdf: PDFDocument, pages: [CGPDFPage])?
     @State private var picking = false
     @State private var pendingDelete: DocumentFolder?
     @State private var errorText: String?
@@ -26,7 +26,7 @@ struct ContentView: View {
                     .padding(.horizontal)
                     .padding(.vertical, 8)
                     .background(.bar)
-                    PDFNoteView(folder: current.folder, document: current.pdf)
+                    PDFNoteView(folder: current.folder, document: current.pdf, pages: current.pages)
                 }
             } else {
                 library
@@ -98,10 +98,10 @@ struct ContentView: View {
     }
 
     private func open(_ folder: DocumentFolder) {
-        guard let pdf = PDFDocument(url: folder.pdfURL) else {
-            errorText = "PDF 파일을 읽을 수 없습니다."
+        guard let pdf = PDFDocument(url: folder.pdfURL), let pages = pdf.cgPages else {
+            errorText = NotAPDF().localizedDescription
             return
         }
-        opened = (folder, pdf)
+        opened = (folder, pdf, pages)
     }
 }

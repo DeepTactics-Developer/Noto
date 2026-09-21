@@ -3,26 +3,46 @@ import PDFKit
 import PencilKit
 import SwiftUI
 
-// Continuous vertical PDF with one PencilKit canvas per page.
-// PDFView sizes each overlay to its page, so strokes live in page space and survive rotation and zoom.
-final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider, PKToolPickerObserver, PKCanvasViewDelegate {
+// Own page viewer: a vertical stack of pages inside a UIScrollView.
+// Pinch zoom is baked in when the gesture ends (pages are re-laid-out at the new size with zoomScale back at 1),
+// so both the PDF tiles and the ink are rendered at the real display size rather than scaled up.
+final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToolPickerObserver, PKCanvasViewDelegate {
     private let folder: DocumentFolder
-    private let document: PDFDocument
-    private let pdfView = PDFView()
+    private let document: PDFDocument // keeps the CGPDFPages alive
+    private let pages: [CGPDFPage]
+    private let pageSizes: [CGSize] // displayed size in PDF points
+
+    private let scrollView = UIScrollView()
+    private let contentView = UIView()
     private let toolPicker = PKToolPicker()
-    private var canvases: [PDFPage: PKCanvasView] = [:]
-    private var drawings: [PDFPage: PKDrawing] = [:]
-    private var dirty: Set<PDFPage> = []
+
+    private var frames: [CGRect] = []
+    private var live: [Int: PageView] = [:]
+    private var zoom: CGFloat = 1
+    private var laidOutWidth: CGFloat = 0
+    private var isBaking = false
+    private let maxZoom: CGFloat = 4
+    private let margin: CGFloat = 12 // page gap and side margin at zoom 1; scales with zoom
+
+    private var drawings: [Int: PKDrawing] = [:]
+    private var dirty: Set<Int> = []
     private var saveTimer: Timer?
     private var saveAlertShown = false
     private var currentTool: PKTool = PKInkingTool(.pen, color: .black, width: 4)
 
-    // The controller is the picker's responder, so the palette stays up while canvases come and go.
+    // The controller is the picker's responder, so the palette stays up while pages come and go.
     override var canBecomeFirstResponder: Bool { true }
 
-    init(folder: DocumentFolder, document: PDFDocument) {
+    init(folder: DocumentFolder, document: PDFDocument, pages: [CGPDFPage]) {
         self.folder = folder
         self.document = document
+        self.pages = pages
+        self.pageSizes = pages.map { page in
+            let box = page.getBoxRect(.cropBox)
+            let rotated = page.rotationAngle % 180 != 0
+            let size = rotated ? CGSize(width: box.height, height: box.width) : box.size
+            return size.width > 0 && size.height > 0 ? size : CGSize(width: 612, height: 792)
+        }
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -30,17 +50,19 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        pdfView.frame = view.bounds
-        pdfView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        pdfView.backgroundColor = .systemGray5
-        pdfView.displayMode = .singlePageContinuous
-        pdfView.displayDirection = .vertical
-        pdfView.autoScales = true
-        pdfView.usePageViewController(false)
-        pdfView.isInMarkupMode = true // lets touches reach the overlay canvases instead of PDFView's own gestures
-        pdfView.pageOverlayViewProvider = self // must be set before the document
-        pdfView.document = document
-        view.addSubview(pdfView)
+        let fingers = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        scrollView.frame = view.bounds
+        scrollView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        scrollView.backgroundColor = .systemGray5
+        scrollView.delegate = self
+        scrollView.contentInsetAdjustmentBehavior = .never
+        scrollView.delaysContentTouches = false
+        scrollView.bouncesZoom = true
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.panGestureRecognizer.allowedTouchTypes = fingers // the pencil only draws
+        scrollView.pinchGestureRecognizer?.allowedTouchTypes = fingers
+        scrollView.addSubview(contentView)
+        view.addSubview(scrollView)
 
         currentTool = toolPicker.selectedTool
         toolPicker.addObserver(self)
@@ -60,11 +82,117 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
         resignFirstResponder()
     }
 
+    // MARK: Layout
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let width = scrollView.bounds.width
+        guard width > 0, width != laidOutWidth else { return }
+        let anchor = anchorAtTop()
+        let oldWidth = scrollView.contentSize.width
+        let oldX = scrollView.contentOffset.x
+        laidOutWidth = width
+        relayout()
+        updateZoomBounds()
+        if let anchor {
+            let frame = frames[anchor.index]
+            let x = oldWidth > 0 ? oldX / oldWidth * scrollView.contentSize.width : 0
+            scrollView.contentOffset = clamped(CGPoint(x: x, y: frame.minY + anchor.fraction * frame.height))
+        }
+        layoutVisiblePages()
+    }
+
+    // Layout at zoom z is exactly the layout at zoom 1 scaled by z, so baking a pinch causes no visible jump.
+    private func relayout() {
+        let width = scrollView.bounds.width
+        let gap = margin * zoom
+        let pageWidth = max(width - 2 * margin, 1) * zoom
+        var y = gap
+        frames = pageSizes.map { size in
+            let frame = CGRect(x: gap, y: y, width: pageWidth, height: pageWidth * size.height / size.width)
+            y = frame.maxY + gap
+            return frame
+        }
+        let content = CGSize(width: width * zoom, height: y)
+        contentView.frame = CGRect(origin: .zero, size: content)
+        scrollView.contentSize = content
+        for (index, view) in live { view.frame = frames[index] }
+    }
+
+    private func updateZoomBounds() {
+        scrollView.minimumZoomScale = 1 / zoom
+        scrollView.maximumZoomScale = maxZoom / zoom
+    }
+
+    private func clamped(_ offset: CGPoint) -> CGPoint {
+        let bounds = scrollView.bounds.size
+        let content = scrollView.contentSize
+        return CGPoint(x: max(0, min(offset.x, max(0, content.width - bounds.width))),
+                       y: max(0, min(offset.y, max(0, content.height - bounds.height))))
+    }
+
+    private func anchorAtTop() -> (index: Int, fraction: CGFloat)? {
+        let y = scrollView.contentOffset.y
+        guard let index = frames.lastIndex(where: { $0.minY <= y }) ?? frames.indices.first else { return nil }
+        let frame = frames[index]
+        return (index, frame.height > 0 ? (y - frame.minY) / frame.height : 0)
+    }
+
+    // Only pages within about a screen of the viewport get views; the rest are released.
+    private func layoutVisiblePages() {
+        guard !frames.isEmpty else { return }
+        let top = scrollView.contentOffset.y - scrollView.bounds.height
+        let bottom = scrollView.contentOffset.y + scrollView.bounds.height * 2
+        let wanted = Set(frames.indices.filter { frames[$0].maxY >= top && frames[$0].minY <= bottom })
+        for index in Array(live.keys) where !wanted.contains(index) { retire(index) }
+        for index in wanted where live[index] == nil { show(index) }
+    }
+
+    private func show(_ index: Int) {
+        let view = PageView(page: pages[index], pageSize: pageSizes[index])
+        view.frame = frames[index]
+        view.canvas.tool = currentTool
+        view.canvas.drawing = drawing(for: index)
+        view.canvas.delegate = self
+        contentView.addSubview(view)
+        live[index] = view
+    }
+
+    private func retire(_ index: Int) {
+        guard let view = live[index] else { return }
+        drawings[index] = view.canvas.drawing
+        view.removeFromSuperview()
+        live[index] = nil
+        flush()
+    }
+
+    // MARK: UIScrollViewDelegate
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? { contentView }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        guard !isBaking, scrollView.zoomScale == 1 else { return }
+        layoutVisiblePages()
+    }
+
+    func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        guard abs(scale - 1) > 0.01 else { return }
+        let offset = scrollView.contentOffset
+        isBaking = true
+        zoom = min(max(zoom * scale, 1), maxZoom)
+        scrollView.zoomScale = 1
+        relayout()
+        scrollView.contentOffset = clamped(offset)
+        updateZoomBounds()
+        isBaking = false
+        layoutVisiblePages()
+    }
+
     // MARK: Storage
 
-    private func drawing(for page: PDFPage) -> PKDrawing {
-        if let cached = drawings[page] { return cached }
-        let url = folder.drawingURL(page: document.index(for: page))
+    private func drawing(for index: Int) -> PKDrawing {
+        if let cached = drawings[index] { return cached }
+        let url = folder.drawingURL(page: index)
         var loaded = PKDrawing()
         if let data = try? Data(contentsOf: url) {
             if let decoded = try? PKDrawing(data: data) {
@@ -74,7 +202,7 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
                 try? FileManager.default.moveItem(at: url, to: url.appendingPathExtension("corrupt"))
             }
         }
-        drawings[page] = loaded
+        drawings[index] = loaded
         return loaded
     }
 
@@ -86,11 +214,11 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
     @objc private func flush() {
         saveTimer?.invalidate()
         saveTimer = nil
-        for page in dirty {
-            let drawing = canvases[page]?.drawing ?? drawings[page] ?? PKDrawing()
+        for index in dirty {
+            let drawing = live[index]?.canvas.drawing ?? drawings[index] ?? PKDrawing()
             do {
-                try drawing.dataRepresentation().write(to: folder.drawingURL(page: document.index(for: page)), options: .atomic)
-                dirty.remove(page)
+                try drawing.dataRepresentation().write(to: folder.drawingURL(page: index), options: .atomic)
+                dirty.remove(index)
             } catch {
                 reportSaveFailure(error) // stays dirty, so the next flush retries
                 return
@@ -109,48 +237,17 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
     // MARK: PKCanvasViewDelegate
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-        guard let page = canvases.first(where: { $0.value === canvasView })?.key else { return }
-        drawings[page] = canvasView.drawing
-        dirty.insert(page)
+        guard let index = live.first(where: { $0.value.canvas === canvasView })?.key else { return }
+        drawings[index] = canvasView.drawing
+        dirty.insert(index)
         scheduleSave()
-    }
-
-    // MARK: PDFPageOverlayViewProvider
-
-    func pdfView(_ pdfView: PDFView, overlayViewFor page: PDFPage) -> UIView? {
-        if let existing = canvases[page] { return existing }
-        let canvas = PKCanvasView()
-        // experiment: PDFView scales the overlay up, which blurs ink; ask for a denser backing store first
-        canvas.contentScaleFactor = min(pdfView.traitCollection.displayScale * pdfView.scaleFactor, 4)
-        canvas.drawingPolicy = .pencilOnly
-        canvas.backgroundColor = .clear
-        canvas.isOpaque = false
-        canvas.isScrollEnabled = false
-        canvas.overrideUserInterfaceStyle = .light // ink is drawn on white paper in both modes
-        canvas.tool = currentTool
-        canvas.drawing = drawing(for: page)
-        canvas.delegate = self
-        canvases[page] = canvas
-        return canvas
-    }
-
-    func pdfView(_ pdfView: PDFView, willDisplayOverlayView overlayView: UIView, for page: PDFPage) {
-        // PDFKit turns interaction off on its page views, which would swallow touches meant for the canvas.
-        overlayView.superview?.isUserInteractionEnabled = true
-    }
-
-    func pdfView(_ pdfView: PDFView, willEndDisplayingOverlayView overlayView: UIView, for page: PDFPage) {
-        guard let canvas = overlayView as? PKCanvasView else { return }
-        drawings[page] = canvas.drawing
-        flush()
-        canvases[page] = nil
     }
 
     // MARK: PKToolPickerObserver
 
     private func apply(_ tool: PKTool) {
         currentTool = tool
-        canvases.values.forEach { $0.tool = tool }
+        live.values.forEach { $0.canvas.tool = tool }
     }
 
     func toolPickerSelectedToolDidChange(_ toolPicker: PKToolPicker) {
@@ -166,9 +263,10 @@ final class PDFNoteViewController: UIViewController, PDFPageOverlayViewProvider,
 struct PDFNoteView: UIViewControllerRepresentable {
     let folder: DocumentFolder
     let document: PDFDocument
+    let pages: [CGPDFPage]
 
     func makeUIViewController(context: Context) -> PDFNoteViewController {
-        PDFNoteViewController(folder: folder, document: document)
+        PDFNoteViewController(folder: folder, document: document, pages: pages)
     }
 
     func updateUIViewController(_ controller: PDFNoteViewController, context: Context) {}
