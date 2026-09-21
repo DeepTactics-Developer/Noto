@@ -14,6 +14,7 @@ struct ContentView: View {
     @State private var documents: [DocumentFolder] = []
     @State private var opened: (folder: DocumentFolder, pdf: PDFDocument, pages: [CGPDFPage])?
     @State private var picking = false
+    @State private var showingSettings = false
     @State private var pendingDelete: DocumentFolder?
     @State private var errorText: String?
 
@@ -31,6 +32,8 @@ struct ContentView: View {
                         Text(current.folder.title).font(.headline).lineLimit(1)
                         Spacer()
                         Text(AppInfo.version).font(.caption).foregroundStyle(.secondary)
+                        Button { showingSettings = true } label: { Image(systemName: "gearshape") }
+                            .accessibilityLabel("설정")
                     }
                     .padding(.horizontal)
                     .padding(.vertical, 8)
@@ -42,6 +45,7 @@ struct ContentView: View {
             }
         }
         .onAppear { documents = Library.all() }
+        .sheet(isPresented: $showingSettings) { SettingsView() }
         .fileImporter(isPresented: $picking, allowedContentTypes: [.pdf]) { result in
             switch result {
             case .success(let url):
@@ -77,6 +81,9 @@ struct ContentView: View {
                     Text(AppInfo.version).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button { showingSettings = true } label: { Image(systemName: "gearshape") }
+                    .accessibilityLabel("설정")
+                    .padding(.trailing, 8)
                 Button("PDF 열기") { picking = true }
                     .buttonStyle(.borderedProminent)
             }

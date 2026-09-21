@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Fast compile check, so a build can go to TestFlight without waiting for the tests.
   simulator:
     runs-on: macos-latest
     steps:
@@ -14,7 +15,6 @@ jobs:
         run: |
           xcodebuild -version
           xcodebuild -showsdks | grep -i ios
-          ls /Applications | grep -i xcode
       - run: brew install xcodegen
       - run: xcodegen generate
       - name: Build for simulator
@@ -23,6 +23,14 @@ jobs:
             -project Noto.xcodeproj -scheme Noto \
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO
+
+  # Runs in parallel; booting the simulator makes it slow (about ten minutes).
+  tests:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: brew install xcodegen
+      - run: xcodegen generate
       - name: Unit tests
         run: |
           UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for k,v in d.items() if 'iOS' in k for x in v if 'iPad' in x['name']))")

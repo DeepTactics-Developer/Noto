@@ -33,36 +33,35 @@ final class InkStore {
     }
 
     func add(_ stroke: InkStroke, on page: Int) {
-        insert([stroke], on: page)
+        replace(remove: [], insert: [stroke], on: page)
     }
 
-    // Removes strokes without registering undo, so a whole eraser drag can be undone as one step (see commitErase).
+    // One undoable edit: takes out `ids` and puts `added` in. It registers its own inverse, which is what makes redo work.
+    func replace(remove ids: Set<UUID>, insert added: [InkStroke], on page: Int) {
+        let removed = edit(remove: ids, insert: added, on: page)
+        let addedIDs = Set(added.map(\.id))
+        undoManager()?.registerUndo(withTarget: self) { $0.replace(remove: addedIDs, insert: removed, on: page) }
+    }
+
+    // The same edit without undo, for something that changes many times while a pen is down (eraser).
+    // The caller collects what happened and registers one undo step at the end with commitErase.
     @discardableResult
-    func erase(_ ids: Set<UUID>, on page: Int) -> [InkStroke] {
+    func liveEdit(remove ids: Set<UUID>, insert added: [InkStroke], on page: Int) -> [InkStroke] {
+        edit(remove: ids, insert: added, on: page)
+    }
+
+    func commitErase(removed: [InkStroke], added: [InkStroke], on page: Int) {
+        let addedIDs = Set(added.map(\.id))
+        undoManager()?.registerUndo(withTarget: self) { $0.replace(remove: addedIDs, insert: removed, on: page) }
+    }
+
+    private func edit(remove ids: Set<UUID>, insert added: [InkStroke], on page: Int) -> [InkStroke] {
         let all = strokes(on: page)
         let removed = all.filter { ids.contains($0.id) }
-        guard !removed.isEmpty else { return [] }
-        pages[page] = all.filter { !ids.contains($0.id) }
+        guard !removed.isEmpty || !added.isEmpty else { return [] }
+        pages[page] = all.filter { !ids.contains($0.id) } + added
         touched(page)
         return removed
-    }
-
-    func commitErase(_ removed: [InkStroke], on page: Int) {
-        undoManager()?.registerUndo(withTarget: self) { $0.insert(removed, on: page) }
-    }
-
-    // The two primitives each register their inverse, which is what makes redo work.
-    private func insert(_ added: [InkStroke], on page: Int) {
-        pages[page] = strokes(on: page) + added
-        touched(page)
-        let ids = Set(added.map(\.id))
-        undoManager()?.registerUndo(withTarget: self) { $0.remove(ids, on: page) }
-    }
-
-    private func remove(_ ids: Set<UUID>, on page: Int) {
-        let removed = erase(ids, on: page)
-        guard !removed.isEmpty else { return }
-        undoManager()?.registerUndo(withTarget: self) { $0.insert(removed, on: page) }
     }
 
     private func touched(_ page: Int) {

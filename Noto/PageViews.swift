@@ -91,6 +91,7 @@ final class PageView: UIView {
     private let preview = UIImageView()
     private var tile: PDFTileView
     private var backTile: PDFTileView? // the previous tiles, kept underneath while the new ones draw
+    private var resizePicture: UIView? // stand-in for the tiles while the page changes size
     private var screenScale: CGFloat = 0
     private var renderZoom: CGFloat = 1
 
@@ -134,6 +135,32 @@ final class PageView: UIView {
         }
     }
 
+    // Call right before the page changes size (rotation, split view): a picture of the current tiles stays underneath,
+    // stretching along with the page, until fresh tiles cover it. A tile view that resizes would just redraw blank.
+    func beginResize(renderZoom zoom: CGFloat) {
+        resizePicture?.removeFromSuperview()
+        resizePicture = nil
+        if bounds.width > 0, let picture = tile.snapshotView(afterScreenUpdates: false) {
+            insertSubview(picture, aboveSubview: preview)
+            resizePicture = picture
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self, weak picture] in
+                guard let picture, self?.resizePicture === picture else { return }
+                picture.removeFromSuperview()
+                self?.resizePicture = nil
+            }
+        }
+        renderZoom = zoom
+        backTile?.removeFromSuperview()
+        backTile = nil
+        let old = tile
+        let fresh = PDFTileView(page: pdfPage)
+        fresh.renderScale = screenScale > 0 ? tileScale : nil
+        fresh.frame = bounds
+        insertSubview(fresh, aboveSubview: old)
+        old.removeFromSuperview()
+        tile = fresh
+    }
+
     override func didMoveToWindow() {
         super.didMoveToWindow()
         guard let scale = window?.screen.scale, screenScale == 0 else { return }
@@ -144,6 +171,7 @@ final class PageView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         preview.frame = bounds
+        resizePicture?.frame = bounds
         backTile?.frame = bounds
         tile.frame = bounds
         ink.frame = bounds

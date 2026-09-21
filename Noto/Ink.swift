@@ -19,14 +19,16 @@ struct InkStroke: Identifiable, Codable {
     let kind: InkKind
     let color: [Float] // r, g, b, a
     let width: Float // page points
+    let pressure: Float // 0 = constant width; otherwise how strongly pen force changes the width
     let points: [InkPoint]
     let bounds: CGRect // derived from the points, not stored
 
-    init(id: UUID = UUID(), kind: InkKind, color: [Float], width: Float, points: [InkPoint]) {
+    init(id: UUID = UUID(), kind: InkKind, color: [Float], width: Float, pressure: Float = 0, points: [InkPoint]) {
         self.id = id
         self.kind = kind
         self.color = color
         self.width = width
+        self.pressure = pressure
         self.points = points
         self.bounds = InkStroke.bounds(of: points)
     }
@@ -34,6 +36,17 @@ struct InkStroke: Identifiable, Codable {
     static func uiColor(_ rgba: [Float]) -> UIColor {
         guard rgba.count == 4 else { return .black }
         return UIColor(red: CGFloat(rgba[0]), green: CGFloat(rgba[1]), blue: CGFloat(rgba[2]), alpha: CGFloat(rgba[3]))
+    }
+
+    // The same stroke moved, as a new stroke: every edit gets a fresh identity so views and undo never
+    // confuse the old geometry with the new.
+    func moved(by offset: CGSize) -> InkStroke {
+        InkStroke(kind: kind, color: color, width: width, pressure: pressure, points: points.map {
+            var p = $0
+            p.x += Float(offset.width)
+            p.y += Float(offset.height)
+            return p
+        })
     }
 
     private static func bounds(of points: [InkPoint]) -> CGRect {
@@ -47,7 +60,7 @@ struct InkStroke: Identifiable, Codable {
     }
 
     // Points are stored flat (x, y, force, time) to keep the file small.
-    private enum CodingKeys: String, CodingKey { case id, kind, color, width, pts }
+    private enum CodingKeys: String, CodingKey { case id, kind, color, width, pressure, pts }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -63,6 +76,7 @@ struct InkStroke: Identifiable, Codable {
                   kind: try container.decode(InkKind.self, forKey: .kind),
                   color: color,
                   width: try container.decode(Float.self, forKey: .width),
+                  pressure: try container.decodeIfPresent(Float.self, forKey: .pressure) ?? 0, // files from before pressure
                   points: points)
     }
 
@@ -72,6 +86,7 @@ struct InkStroke: Identifiable, Codable {
         try container.encode(kind, forKey: .kind)
         try container.encode(color, forKey: .color)
         try container.encode(width, forKey: .width)
+        try container.encode(pressure, forKey: .pressure)
         try container.encode(points.flatMap { [$0.x, $0.y, $0.force, $0.time] }, forKey: .pts)
     }
 }
@@ -80,6 +95,12 @@ struct InkStroke: Identifiable, Codable {
 struct InkPageFile: Codable {
     var version = 1
     var strokes: [InkStroke]
+}
+
+// A stretch of a stroke drawn at one width. A pressure-sensitive stroke is a chain of runs whose widths follow the pen force.
+struct InkRun {
+    var points: [InkPoint]
+    var width: CGFloat
 }
 
 enum InkGeometry {
@@ -104,6 +125,35 @@ enum InkGeometry {
         return path
     }
 
+    // Splits a stroke into runs of one width each. Force is averaged over five samples and the width only steps
+    // when it has really moved, so pen jitter does not chop the stroke into many runs. Neighbouring runs share a point.
+    static func runs(of points: [InkPoint], width: Float, pressure: Float) -> [InkRun] {
+        guard pressure > 0, points.count > 2 else { return [InkRun(points: points, width: CGFloat(width))] }
+        let step = max(CGFloat(width) * 0.1, 0.05)
+        let smooth: [Float] = points.indices.map { i in
+            let lo = max(0, i - 2), hi = min(points.count - 1, i + 2)
+            return points[lo...hi].reduce(0) { $0 + $1.force } / Float(hi - lo + 1)
+        }
+        func levels(_ i: Int) -> CGFloat {
+            let factor = max(0.2, 1 + CGFloat(pressure) * (CGFloat(smooth[i]) - 0.5))
+            return factor * CGFloat(width) / step
+        }
+        var runs: [InkRun] = []
+        var current = [points[0]]
+        var level = max(1, Int(levels(0).rounded()))
+        for i in 1..<points.count {
+            let x = levels(i)
+            current.append(points[i])
+            if abs(x - CGFloat(level)) >= 0.75 {
+                runs.append(InkRun(points: current, width: CGFloat(level) * step))
+                current = [points[i]]
+                level = max(1, Int(x.rounded()))
+            }
+        }
+        if current.count > 1 || runs.isEmpty { runs.append(InkRun(points: current, width: CGFloat(level) * step)) }
+        return runs
+    }
+
     static func distance(from p: CGPoint, to a: CGPoint, _ b: CGPoint) -> CGFloat {
         let dx = b.x - a.x, dy = b.y - a.y
         let lengthSquared = dx * dx + dy * dy
@@ -122,5 +172,62 @@ enum InkGeometry {
             return true
         }
         return false
+    }
+
+    // Partial eraser: what is left of the stroke after a circle of `radius` around `center` is taken out of it.
+    // nil when the circle does not touch the stroke; an empty array when nothing is left.
+    static func cut(_ stroke: InkStroke, around center: CGPoint, radius: CGFloat) -> [InkStroke]? {
+        guard hit(stroke, at: center, radius: radius) else { return nil }
+        let reach = radius + CGFloat(stroke.width) / 2
+        let points = stroke.points
+        var pieces: [[InkPoint]] = []
+        var current: [InkPoint] = []
+        func flush() {
+            if !current.isEmpty { pieces.append(current) }
+            current = []
+        }
+        if hypot(points[0].cg.x - center.x, points[0].cg.y - center.y) >= reach { current = [points[0]] }
+        for i in 1..<points.count {
+            let a = points[i - 1], b = points[i]
+            if let (lo, hi) = insideInterval(a.cg, b.cg, center: center, reach: reach) {
+                if lo > 0 { current.append(lerp(a, b, lo)) } // walked up to the circle
+                flush()
+                if hi < 1 { current = [lerp(a, b, hi), b] } // came out the other side
+            } else {
+                if current.isEmpty { current.append(a) }
+                current.append(b)
+            }
+        }
+        flush()
+        return pieces
+            .filter { $0.count >= 2 && ShapeRecognizer.pathLength($0.map(\.cg)) >= 0.3 }
+            .map { InkStroke(kind: stroke.kind, color: stroke.color, width: stroke.width, pressure: stroke.pressure, points: $0) }
+    }
+
+    // The part of segment a-b (as parameters 0...1) that lies inside the circle, if any.
+    private static func insideInterval(_ a: CGPoint, _ b: CGPoint, center: CGPoint, reach: CGFloat) -> (CGFloat, CGFloat)? {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let fx = a.x - center.x, fy = a.y - center.y
+        let qa = dx * dx + dy * dy
+        let qc = fx * fx + fy * fy - reach * reach
+        guard qa > 0 else { return qc < 0 ? (0, 1) : nil }
+        let qb = 2 * (fx * dx + fy * dy)
+        let discriminant = qb * qb - 4 * qa * qc
+        guard discriminant > 0 else { return nil }
+        let root = sqrt(discriminant)
+        let lo = max((-qb - root) / (2 * qa), 0), hi = min((-qb + root) / (2 * qa), 1)
+        return lo < hi ? (lo, hi) : nil
+    }
+
+    private static func lerp(_ a: InkPoint, _ b: InkPoint, _ t: CGFloat) -> InkPoint {
+        let t = Float(t)
+        return InkPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t,
+                        force: a.force + (b.force - a.force) * t, time: a.time + (b.time - a.time) * t)
+    }
+
+    // Lasso: a stroke is picked when at least half of its points are inside the loop.
+    static func isSelected(_ stroke: InkStroke, by lasso: CGPath) -> Bool {
+        let inside = stroke.points.filter { lasso.contains($0.cg, using: .evenOdd) }.count
+        return inside * 2 >= stroke.points.count
     }
 }

@@ -24,6 +24,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     private let margin: CGFloat = 12 // page gap and side margin
 
     private var mode: InkMode = .none
+    private var currentTool: PKTool = PKInkingTool(.pen)
     private var saveAlertShown = false
 
     private let previews = NSCache<NSNumber, UIImage>()
@@ -74,6 +75,12 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         toolPicker.addObserver(self)
         toolPicker.setVisible(true, forFirstResponder: self)
         NotificationCenter.default.addObserver(self, selector: #selector(flush), name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: UserDefaults.didChangeNotification, object: nil)
+    }
+
+    // The eraser mode setting decides how the palette's eraser behaves, so the tool is mapped again.
+    @objc private func settingsChanged() {
+        apply(currentTool)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -107,7 +114,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         laidOutWidth = width
         scrollView.setZoomScale(1, animated: false)
         renderZoom = 1
-        live.values.forEach { $0.setRenderZoom(1) }
+        live.values.forEach { $0.beginResize(renderZoom: 1) } // before the pages change size
         relayout()
         if let anchor {
             let frame = frames[anchor.index]
@@ -222,6 +229,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
 
     // Widths from the palette are in PencilKit's units, scaled here to page points. Tune by feel.
     private func apply(_ tool: PKTool) {
+        currentTool = tool
         switch tool {
         case let ink as PKInkingTool:
             var color = Self.rgba(ink.color)
@@ -231,10 +239,16 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
             } else {
                 mode = .draw(kind: .pen, color: color, width: max(Float(ink.width) * 0.5, 0.5))
             }
-        case is PKEraserTool:
-            mode = .erase
+        case let eraser as PKEraserTool:
+            switch AppSettings.eraserMode {
+            case .partial: mode = .erase(partial: true)
+            case .stroke: mode = .erase(partial: false)
+            case .palette: mode = .erase(partial: eraser.eraserType != .vector)
+            }
+        case is PKLassoTool:
+            mode = .lasso
         default:
-            mode = .none // lasso and ruler are not built yet
+            mode = .none // the ruler is not built yet
         }
         live.values.forEach { $0.ink.mode = mode }
     }
