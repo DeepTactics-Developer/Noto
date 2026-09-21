@@ -30,7 +30,7 @@ final class InkTests: XCTestCase {
     func testFileWithoutPressureKeyStillOpens() throws {
         let old: [String: Any] = [
             "version": 1,
-            "strokes": [["id": UUID().uuidString, "kind": 0, "color": [0, 0, 0, 1], "width": 2, "pts": [1, 2, 0.5, 0, 3, 4, 0.5, 0.1]]],
+            "strokes": [["id": UUID().uuidString, "kind": 0, "color": [0, 0, 0, 1], "width": 2, "pts": [1, 2, 0.5, 0, 3, 4, 0.5, 0.25]]], // values a Float holds exactly, as the app's own files do
         ]
         let data = try PropertyListSerialization.data(fromPropertyList: old, format: .binary, options: 0)
         let decoded = try PropertyListDecoder().decode(InkPageFile.self, from: data)
