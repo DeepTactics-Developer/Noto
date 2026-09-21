@@ -4,7 +4,7 @@ import SwiftUI
 struct NotoApp: App {
     var body: some Scene {
         WindowGroup {
-            CanvasScreen().ignoresSafeArea()
+            ContentView()
         }
     }
 }
