@@ -17,6 +17,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.deeptactics.noto
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    scheme:
+      testTargets: [NotoTests]
     info:
       path: Noto/Info.plist
       properties:
@@ -28,3 +30,13 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+  NotoTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [NotoTests]
+    dependencies:
+      - target: Noto
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.deeptactics.noto.tests
+        GENERATE_INFOPLIST_FILE: YES
