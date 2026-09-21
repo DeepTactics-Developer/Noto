@@ -2,6 +2,14 @@ import SwiftUI
 import PDFKit
 import UniformTypeIdentifiers
 
+enum AppInfo {
+    // Shown in the UI so a TestFlight tester can tell which build is installed.
+    static var version: String {
+        let info = Bundle.main.infoDictionary
+        return "v\(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))"
+    }
+}
+
 struct ContentView: View {
     @State private var documents: [DocumentFolder] = []
     @State private var opened: (folder: DocumentFolder, pdf: PDFDocument, pages: [CGPDFPage])?
@@ -22,6 +30,7 @@ struct ContentView: View {
                         }
                         Text(current.folder.title).font(.headline).lineLimit(1)
                         Spacer()
+                        Text(AppInfo.version).font(.caption).foregroundStyle(.secondary)
                     }
                     .padding(.horizontal)
                     .padding(.vertical, 8)
@@ -63,7 +72,10 @@ struct ContentView: View {
     private var library: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Noto").font(.largeTitle.bold())
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Noto").font(.largeTitle.bold())
+                    Text(AppInfo.version).font(.caption).foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button("PDF 열기") { picking = true }
                     .buttonStyle(.borderedProminent)
