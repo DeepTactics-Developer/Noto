@@ -6,12 +6,18 @@ enum PDFRenderer {
 
     // Draws the page to fill `size` in a UIKit-style (top-left origin) context.
     static func draw(_ page: CGPDFPage, in ctx: CGContext, size: CGSize) {
+        // CGPDFPage.getDrawingTransform never scales a page up, only down, so it is asked to map the page at its
+        // natural size (which gives rotation and box origin) and the scaling to `size` is done here.
+        let box = page.getBoxRect(.cropBox)
+        let natural = page.rotationAngle % 180 != 0 ? CGSize(width: box.height, height: box.width) : box.size
+        guard natural.width > 0, natural.height > 0 else { return }
         lock.lock()
         defer { lock.unlock() }
         ctx.saveGState()
         ctx.translateBy(x: 0, y: size.height)
         ctx.scaleBy(x: 1, y: -1)
-        ctx.concatenate(page.getDrawingTransform(.cropBox, rect: CGRect(origin: .zero, size: size), rotate: 0, preserveAspectRatio: true))
+        ctx.scaleBy(x: size.width / natural.width, y: size.height / natural.height)
+        ctx.concatenate(page.getDrawingTransform(.cropBox, rect: CGRect(origin: .zero, size: natural), rotate: 0, preserveAspectRatio: true))
         ctx.drawPDFPage(page)
         ctx.restoreGState()
     }
@@ -36,8 +42,15 @@ final class NoFadeTiledLayer: CATiledLayer {
 }
 
 // Draws one PDF page at whatever size it is laid out at, tile by tile, so it stays sharp at any zoom.
+// Never change contentScaleFactor of a tile view that has already drawn: its cached tiles then show at the
+// wrong size. PageView swaps in a fresh tile view instead (as Apple's ZoomingPDFViewer sample does).
 final class PDFTileView: UIView {
     private let page: CGPDFPage
+
+    // Pixels per point the tiles are drawn at; applied once, before the first tile is drawn.
+    var renderScale: CGFloat? {
+        didSet { applyRenderScale() }
+    }
 
     override class var layerClass: AnyClass { NoFadeTiledLayer.self }
 
@@ -52,6 +65,17 @@ final class PDFTileView: UIView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        applyRenderScale()
+    }
+
+    private func applyRenderScale() {
+        guard let scale = renderScale, window != nil, contentScaleFactor != scale else { return }
+        contentScaleFactor = scale
+        setNeedsDisplay()
+    }
+
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
         ctx.setFillColor(UIColor.white.cgColor)
@@ -63,13 +87,17 @@ final class PDFTileView: UIView {
 // One page, bottom to top: low-res preview, sharp PDF tiles, ink.
 final class PageView: UIView {
     let ink: InkPageView
+    private let pdfPage: CGPDFPage
     private let preview = UIImageView()
-    private let tile: PDFTileView
-    private var snapshot: UIView?
+    private var tile: PDFTileView
+    private var backTile: PDFTileView? // the previous tiles, kept underneath while the new ones draw
     private var screenScale: CGFloat = 0
     private var renderZoom: CGFloat = 1
 
+    private var tileScale: CGFloat { min(screenScale * renderZoom, 8) }
+
     init(page: CGPDFPage, pageSize: CGSize, index: Int, store: InkStore) {
+        pdfPage = page
         tile = PDFTileView(page: page)
         ink = InkPageView(page: index, pageSize: pageSize, store: store)
         super.init(frame: .zero)
@@ -90,44 +118,33 @@ final class PageView: UIView {
     func setRenderZoom(_ zoom: CGFloat) {
         guard zoom != renderZoom else { return }
         renderZoom = zoom
-        applyTileScale(animated: true)
+        guard screenScale > 0, tile.renderScale != tileScale else { return }
+        let old = tile
+        backTile?.removeFromSuperview()
+        backTile = old
+        let fresh = PDFTileView(page: pdfPage)
+        fresh.renderScale = tileScale
+        fresh.frame = bounds
+        insertSubview(fresh, aboveSubview: old)
+        tile = fresh
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak old] in
+            guard let old, self?.backTile === old else { return }
+            old.removeFromSuperview()
+            self?.backTile = nil
+        }
     }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        guard let scale = window?.screen.scale else { return }
+        guard let scale = window?.screen.scale, screenScale == 0 else { return }
         screenScale = scale
-        applyTileScale(animated: false)
-    }
-
-    private func applyTileScale(animated: Bool) {
-        guard screenScale > 0 else { return }
-        let target = min(screenScale * renderZoom, 8)
-        guard target != tile.contentScaleFactor else { return }
-        if animated { freezeTile() }
-        tile.contentScaleFactor = target
-        tile.setNeedsDisplay()
-    }
-
-    // Keeps a picture of the current tiles underneath until the freshly drawn ones cover it, so the page
-    // never goes blank while it redraws.
-    private func freezeTile() {
-        snapshot?.removeFromSuperview()
-        snapshot = nil
-        guard bounds.width > 0, let picture = tile.snapshotView(afterScreenUpdates: false) else { return }
-        insertSubview(picture, belowSubview: tile)
-        snapshot = picture
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self, weak picture] in
-            guard let picture, self?.snapshot === picture else { return }
-            picture.removeFromSuperview()
-            self?.snapshot = nil
-        }
+        tile.renderScale = tileScale
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         preview.frame = bounds
-        snapshot?.frame = bounds
+        backTile?.frame = bounds
         tile.frame = bounds
         ink.frame = bounds
     }
