@@ -3,17 +3,10 @@ import PDFKit
 import PencilKit
 import SwiftUI
 
-// Own page viewer: a vertical stack of pages inside a UIScrollView.
-// Pinch zoom is handled here, not by the scroll view: while the fingers are down the page container is just
-// scaled (fast, briefly soft); on release the pages are laid out at the new size and the PDF tiles redraw sharp.
-// Ink is vector, so it stays sharp throughout. PencilKit is only used for its tool palette.
-final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, UIGestureRecognizerDelegate, PKToolPickerObserver {
-    private struct PinchState {
-        var focal: CGPoint // point of the content under the fingers when the pinch began
-        var screen: CGPoint // where the fingers are now, in this controller's view
-        var scale = CGFloat(1) // zoom change since the pinch began
-    }
-
+// Own page viewer: a vertical stack of pages inside a UIScrollView with its standard pinch zoom.
+// Layout never changes while zooming. Ink is vector and scales with the container; when a pinch ends the PDF
+// tiles are redrawn at the new resolution. PencilKit is only used for its tool palette.
+final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToolPickerObserver {
     private let folder: DocumentFolder
     private let document: PDFDocument // keeps the CGPDFPages alive
     private let pages: [CGPDFPage]
@@ -26,11 +19,9 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, UIGes
 
     private var frames: [CGRect] = []
     private var live: [Int: PageView] = [:]
-    private var zoom: CGFloat = 1
     private var laidOutWidth: CGFloat = 0
-    private var pinch: PinchState?
-    private let maxZoom: CGFloat = 4
-    private let margin: CGFloat = 12 // page gap and side margin at zoom 1; scales with zoom
+    private var renderZoom: CGFloat = 1
+    private let margin: CGFloat = 12 // page gap and side margin
 
     private var mode: InkMode = .none
     private var saveAlertShown = false
@@ -71,15 +62,13 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, UIGes
         scrollView.contentInsetAdjustmentBehavior = .never
         scrollView.delaysContentTouches = false
         scrollView.showsHorizontalScrollIndicator = false
+        scrollView.minimumZoomScale = 1
+        scrollView.maximumZoomScale = 4
+        scrollView.bouncesZoom = true
         scrollView.panGestureRecognizer.allowedTouchTypes = fingers // the pencil only draws
-        contentView.layer.anchorPoint = .zero // scale about the top-left corner while pinching
+        scrollView.pinchGestureRecognizer?.allowedTouchTypes = fingers
         scrollView.addSubview(contentView)
         view.addSubview(scrollView)
-
-        let pinchRecognizer = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
-        pinchRecognizer.allowedTouchTypes = fingers
-        pinchRecognizer.delegate = self
-        scrollView.addGestureRecognizer(pinchRecognizer)
 
         apply(toolPicker.selectedTool)
         toolPicker.addObserver(self)
@@ -105,35 +94,39 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, UIGes
 
     // MARK: Layout
 
+    // The part of the content currently on screen, in content coordinates (undoes the zoom).
+    private func visibleRect() -> CGRect {
+        scrollView.convert(scrollView.bounds, to: contentView)
+    }
+
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let width = scrollView.bounds.width
-        guard width > 0, width != laidOutWidth, pinch == nil else { return }
+        guard width > 0, width != laidOutWidth else { return }
         let anchor = anchorAtTop()
-        let oldWidth = scrollView.contentSize.width
-        let oldX = scrollView.contentOffset.x
         laidOutWidth = width
+        scrollView.setZoomScale(1, animated: false)
+        renderZoom = 1
+        live.values.forEach { $0.setRenderZoom(1) }
         relayout()
         if let anchor {
             let frame = frames[anchor.index]
-            let x = oldWidth > 0 ? oldX / oldWidth * scrollView.contentSize.width : 0
-            scrollView.contentOffset = clamped(CGPoint(x: x, y: frame.minY + anchor.fraction * frame.height))
+            scrollView.contentOffset = clamped(CGPoint(x: 0, y: frame.minY + anchor.fraction * frame.height))
         }
         layoutVisiblePages()
     }
 
-    // Layout at zoom z is exactly the layout at zoom 1 scaled by z, so committing a pinch causes no jump.
+    // Only called at zoom 1.
     private func relayout() {
         let width = scrollView.bounds.width
-        let gap = margin * zoom
-        let pageWidth = max(width - 2 * margin, 1) * zoom
-        var y = gap
+        let pageWidth = max(width - 2 * margin, 1)
+        var y = margin
         frames = pageSizes.map { size in
-            let frame = CGRect(x: gap, y: y, width: pageWidth, height: pageWidth * size.height / size.width)
-            y = frame.maxY + gap
+            let frame = CGRect(x: margin, y: y, width: pageWidth, height: pageWidth * size.height / size.width)
+            y = frame.maxY + margin
             return frame
         }
-        let content = CGSize(width: width * zoom, height: y)
+        let content = CGSize(width: width, height: y)
         contentView.frame = CGRect(origin: .zero, size: content)
         scrollView.contentSize = content
         for (index, view) in live { view.frame = frames[index] }
@@ -147,7 +140,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, UIGes
     }
 
     private func anchorAtTop() -> (index: Int, fraction: CGFloat)? {
-        let y = scrollView.contentOffset.y
+        let y = visibleRect().minY
         guard let index = frames.lastIndex(where: { $0.minY <= y }) ?? frames.indices.first else { return nil }
         let frame = frames[index]
         return (index, frame.height > 0 ? (y - frame.minY) / frame.height : 0)
@@ -157,19 +150,19 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, UIGes
     // that, so scrolling back and forth does not rebuild them.
     private func layoutVisiblePages() {
         guard !frames.isEmpty else { return }
-        let y = scrollView.contentOffset.y
-        let height = scrollView.bounds.height
+        let visible = visibleRect()
         func intersects(_ index: Int, above: CGFloat, below: CGFloat) -> Bool {
-            frames[index].maxY >= y - above && frames[index].minY <= y + height + below
+            frames[index].maxY >= visible.minY - above && frames[index].minY <= visible.maxY + below
         }
-        for index in Array(live.keys) where !intersects(index, above: 3 * height, below: 4 * height) { retire(index) }
-        for index in frames.indices where live[index] == nil && intersects(index, above: 1.5 * height, below: 2.5 * height) { show(index) }
+        for index in Array(live.keys) where !intersects(index, above: 3 * visible.height, below: 4 * visible.height) { retire(index) }
+        for index in frames.indices where live[index] == nil && intersects(index, above: 1.5 * visible.height, below: 2.5 * visible.height) { show(index) }
     }
 
     private func show(_ index: Int) {
         let view = PageView(page: pages[index], pageSize: pageSizes[index], index: index, store: store)
         view.frame = frames[index]
         view.ink.mode = mode
+        view.setRenderZoom(renderZoom)
         contentView.addSubview(view)
         live[index] = view
         loadPreview(for: index, into: view)
@@ -197,58 +190,22 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, UIGes
         }
     }
 
-    // MARK: Scrolling and pinching
+    // MARK: UIScrollViewDelegate
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? { contentView }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard pinch == nil else { return }
         layoutVisiblePages()
     }
 
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-        true
-    }
-
-    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
-        switch gesture.state {
-        case .began:
-            pinch = PinchState(focal: gesture.location(in: contentView), screen: gesture.location(in: view))
-            scrollView.panGestureRecognizer.isEnabled = false // the pinch moves the content itself
-        case .changed:
-            guard var state = pinch else { return }
-            state.scale = min(max(zoom * gesture.scale, 1), maxZoom) / zoom
-            state.screen = gesture.location(in: view)
-            pinch = state
-            let base = contentView.bounds.size
-            contentView.transform = CGAffineTransform(scaleX: state.scale, y: state.scale)
-            scrollView.contentSize = CGSize(width: base.width * state.scale, height: base.height * state.scale)
-            scrollView.contentOffset = clamped(offset(for: state))
-        case .ended, .cancelled, .failed:
-            scrollView.panGestureRecognizer.isEnabled = true
-            commitPinch()
-        default:
-            break
-        }
-    }
-
-    // Keeps the point that was under the fingers under the fingers.
-    private func offset(for state: PinchState) -> CGPoint {
-        CGPoint(x: state.focal.x * state.scale - state.screen.x, y: state.focal.y * state.scale - state.screen.y)
-    }
-
-    private func commitPinch() {
-        guard let state = pinch else { return }
-        pinch = nil
-        guard abs(state.scale - 1) > 0.005 else {
-            contentView.transform = .identity
-            scrollView.contentSize = contentView.bounds.size
-            return
-        }
-        live.values.forEach { $0.freezeTile() }
-        contentView.transform = .identity
-        zoom *= state.scale
-        relayout()
-        scrollView.contentOffset = clamped(offset(for: state))
+    func scrollViewDidZoom(_ scrollView: UIScrollView) {
         layoutVisiblePages()
+    }
+
+    // The container was only scaled while pinching, so PDF tiles are soft; redraw them for the new zoom.
+    func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        renderZoom = scale
+        live.values.forEach { $0.setRenderZoom(scale) }
     }
 
     // MARK: Errors

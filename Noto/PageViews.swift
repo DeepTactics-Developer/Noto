@@ -66,6 +66,8 @@ final class PageView: UIView {
     private let preview = UIImageView()
     private let tile: PDFTileView
     private var snapshot: UIView?
+    private var screenScale: CGFloat = 0
+    private var renderZoom: CGFloat = 1
 
     init(page: CGPDFPage, pageSize: CGSize, index: Int, store: InkStore) {
         tile = PDFTileView(page: page)
@@ -84,9 +86,32 @@ final class PageView: UIView {
         preview.image = image
     }
 
-    // Call right before the page is resized: keeps a picture of the old tiles underneath, stretched to the
-    // new size, until the freshly drawn tiles cover it.
-    func freezeTile() {
+    // Tiles are drawn at screen resolution times the zoom, so zooming in stays sharp. Called when a pinch ends.
+    func setRenderZoom(_ zoom: CGFloat) {
+        guard zoom != renderZoom else { return }
+        renderZoom = zoom
+        applyTileScale(animated: true)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard let scale = window?.screen.scale else { return }
+        screenScale = scale
+        applyTileScale(animated: false)
+    }
+
+    private func applyTileScale(animated: Bool) {
+        guard screenScale > 0 else { return }
+        let target = min(screenScale * renderZoom, 8)
+        guard target != tile.contentScaleFactor else { return }
+        if animated { freezeTile() }
+        tile.contentScaleFactor = target
+        tile.setNeedsDisplay()
+    }
+
+    // Keeps a picture of the current tiles underneath until the freshly drawn ones cover it, so the page
+    // never goes blank while it redraws.
+    private func freezeTile() {
         snapshot?.removeFromSuperview()
         snapshot = nil
         guard bounds.width > 0, let picture = tile.snapshotView(afterScreenUpdates: false) else { return }

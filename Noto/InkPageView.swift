@@ -95,6 +95,13 @@ final class InkPageView: UIView {
 
     // MARK: Touches
 
+    // Screen points per page point, including any zoom applied by ancestor views.
+    private var screenPerPagePoint: CGFloat {
+        let origin = convert(CGPoint.zero, to: nil)
+        let unit = convert(CGPoint(x: 1, y: 0), to: nil)
+        return max(hypot(unit.x - origin.x, unit.y - origin.y) * scale, 0.01)
+    }
+
     private func pagePoint(of touch: UITouch) -> CGPoint {
         let location = touch.preciseLocation(in: self)
         return CGPoint(x: location.x / max(scale, 0.01), y: location.y / max(scale, 0.01))
@@ -196,7 +203,7 @@ final class InkPageView: UIView {
 
     // Whole-stroke eraser: every stroke the eraser circle touches goes.
     private func erase(at point: CGPoint) {
-        let radius = 10 / max(scale, 0.01) // 10 screen points
+        let radius = 10 / screenPerPagePoint // 10 screen points, whatever the zoom
         let ids = Set(store.strokes(on: page).filter { InkGeometry.hit($0, at: point, radius: radius) }.map(\.id))
         guard !ids.isEmpty else { return }
         erased += store.erase(ids, on: page)
