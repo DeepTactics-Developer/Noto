@@ -184,6 +184,7 @@ final class ObjectsPageView: PassthroughView {
     private var textViews: [UUID: TextBoxView] = [:]
     private var imageViews: [UUID: ImageBoxView] = [:]
     private var scale: CGFloat = 0
+    private var selectedID: UUID?
 
     init(page: Int, pageSize: CGSize, store: ObjectStore) {
         self.page = page
@@ -266,6 +267,7 @@ final class ObjectsPageView: PassthroughView {
             self?.store.removeText(box.id, on: pageIndex)
             self?.sync()
         }
+        view.onSelect = { [weak self] in self?.select(box.id) }
         host.addSubview(view)
         textViews[box.id] = view
     }
@@ -280,8 +282,25 @@ final class ObjectsPageView: PassthroughView {
             self?.store.removeImage(box.id, on: pageIndex)
             self?.sync()
         }
+        view.onSelect = { [weak self] in self?.select(box.id) }
         host.addSubview(view)
         imageViews[box.id] = view
+    }
+
+    // Only one object shows its delete/move chrome at a time — selecting one hides any other's.
+    private func select(_ id: UUID) {
+        guard selectedID != id else { return }
+        selectedID = id
+        for (viewID, view) in textViews { view.isSelected = viewID == id }
+        for (viewID, view) in imageViews { view.isSelected = viewID == id }
+    }
+
+    // Called whenever a touch lands on the page outside every object (see InkPageView.onCanvasTouch).
+    func deselectAll() {
+        guard selectedID != nil else { return }
+        selectedID = nil
+        textViews.values.forEach { $0.isSelected = false }
+        imageViews.values.forEach { $0.isSelected = false }
     }
 }
 
@@ -295,10 +314,21 @@ final class TextBoxView: UIView, UITextViewDelegate {
     let textView = UITextView()
     private(set) var isDragging = false
 
+    // The move handle and delete button only show while this box is selected, so they don't sit on top of
+    // (and steal finger taps meant for) whatever's underneath the rest of the time. ObjectsPageView keeps this
+    // in sync with which single object is currently selected.
+    var isSelected = false {
+        didSet {
+            guard isSelected != oldValue else { return }
+            handle.isHidden = !isSelected
+        }
+    }
+
     var onChange: ((String) -> Void)?
     var onResize: ((CGRect) -> Void)?
     var onMoveEnded: ((CGRect) -> Void)?
     var onDelete: (() -> Void)?
+    var onSelect: (() -> Void)?
 
     private let handle = UIView()
     private let grip = UIImageView(image: UIImage(systemName: "line.3.horizontal"))
@@ -312,6 +342,7 @@ final class TextBoxView: UIView, UITextViewDelegate {
         backgroundColor = .clear
 
         handle.backgroundColor = .systemGray5
+        handle.isHidden = true
         addSubview(handle)
         grip.tintColor = .secondaryLabel
         grip.contentMode = .center
@@ -345,6 +376,16 @@ final class TextBoxView: UIView, UITextViewDelegate {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         if let touches = event?.allTouches, touches.contains(where: { $0.type == .pencil }) { return nil }
         return super.hitTest(point, with: event)
+    }
+
+    // Belt-and-suspenders alongside the hitTest override above: a finger touch here selects the box (revealing
+    // its handle) before being forwarded on as usual so the textView/handle still get it normally; a pencil
+    // touch is never acted on or forwarded, so it can't be mistaken for a tap-to-select even if something
+    // downstream (Scribble-style text input, a subview's own recognizer) ever bypassed the hitTest check above.
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if touches.contains(where: { $0.type == .pencil }) { return }
+        if !isSelected { isSelected = true; onSelect?() }
+        super.touchesBegan(touches, with: event)
     }
 
     override func layoutSubviews() {
@@ -395,8 +436,17 @@ final class ImageBoxView: UIView {
     private let imageView = UIImageView()
     private let deleteButton = UIButton(type: .system)
 
+    // See the matching property on TextBoxView: the delete button only shows while selected.
+    var isSelected = false {
+        didSet {
+            guard isSelected != oldValue else { return }
+            deleteButton.isHidden = !isSelected
+        }
+    }
+
     var onMoveEnded: ((CGRect) -> Void)?
     var onDelete: (() -> Void)?
+    var onSelect: (() -> Void)?
 
     private var frameAtGestureStart: CGRect = .zero
 
@@ -415,6 +465,7 @@ final class ImageBoxView: UIView {
         deleteButton.tintColor = .secondaryLabel
         deleteButton.backgroundColor = .white
         deleteButton.layer.cornerRadius = 11
+        deleteButton.isHidden = true
         deleteButton.addTarget(self, action: #selector(deleteTapped), for: .touchUpInside)
         addSubview(deleteButton)
 
@@ -434,6 +485,13 @@ final class ImageBoxView: UIView {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         if let touches = event?.allTouches, touches.contains(where: { $0.type == .pencil }) { return nil }
         return super.hitTest(point, with: event)
+    }
+
+    // See the matching override on TextBoxView.
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if touches.contains(where: { $0.type == .pencil }) { return }
+        if !isSelected { isSelected = true; onSelect?() }
+        super.touchesBegan(touches, with: event)
     }
 
     override func layoutSubviews() {

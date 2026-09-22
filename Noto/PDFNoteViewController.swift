@@ -469,6 +469,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         view.frame = frames[index]
         view.ink.mode = mode
         view.ink.textLineProvider = { [weak self] in self?.textLines(on: index) ?? [] }
+        view.ink.onCanvasTouch = { [weak view] in view?.objects.deselectAll() }
         view.setRenderZoom(renderZoom)
         contentView.addSubview(view)
         contentView.sendSubviewToBack(view) // pages never overlap each other, but this keeps overlays (search highlight) on top

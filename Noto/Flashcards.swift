@@ -5,12 +5,33 @@ struct Flashcard: Codable, Identifiable {
     var front: String
     var back: String
     var createdAt: Date
+    var timesStudied: Int = 0
+    var timesKnown: Int = 0
 
-    init(id: UUID = UUID(), front: String, back: String, createdAt: Date = .now) {
+    init(id: UUID = UUID(), front: String, back: String, createdAt: Date = .now, timesStudied: Int = 0, timesKnown: Int = 0) {
         self.id = id
         self.front = front
         self.back = back
         self.createdAt = createdAt
+        self.timesStudied = timesStudied
+        self.timesKnown = timesKnown
+    }
+
+    // nil until studied at least once, so the deck list can show "—" instead of a misleading 0%.
+    var accuracy: Double? { timesStudied > 0 ? Double(timesKnown) / Double(timesStudied) : nil }
+
+    // Custom decode so a deck saved before accuracy tracking existed still loads (missing fields default to 0),
+    // the same pattern InkStroke uses for its own added-later `pressure` field.
+    private enum CodingKeys: String, CodingKey { case id, front, back, createdAt, timesStudied, timesKnown }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        front = try container.decode(String.self, forKey: .front)
+        back = try container.decode(String.self, forKey: .back)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        timesStudied = try container.decodeIfPresent(Int.self, forKey: .timesStudied) ?? 0
+        timesKnown = try container.decodeIfPresent(Int.self, forKey: .timesKnown) ?? 0
     }
 }
 

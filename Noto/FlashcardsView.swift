@@ -7,6 +7,13 @@ struct FlashcardsView: View {
     @State private var studying = false
     @State private var newFront = ""
     @State private var newBack = ""
+    @State private var weakestFirst = false
+
+    private var sortedCards: [Flashcard] {
+        guard weakestFirst else { return cards }
+        // Never-studied cards count as "weakest" (nothing known about them yet), then lowest accuracy first.
+        return cards.sorted { ($0.accuracy ?? -1) < ($1.accuracy ?? -1) }
+    }
 
     var body: some View {
         NavigationStack {
@@ -17,17 +24,35 @@ struct FlashcardsView: View {
                     Button("카드 추가", action: addCard)
                         .disabled(newFront.trimmingCharacters(in: .whitespaces).isEmpty || newBack.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
-                Section("카드 \(cards.count)개") {
+                Section {
                     if cards.isEmpty {
                         Text("아직 카드가 없습니다").font(.caption).foregroundStyle(.secondary)
                     }
-                    ForEach(cards) { card in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(card.front).font(.subheadline)
-                            Text(card.back).font(.caption).foregroundStyle(.secondary)
+                    ForEach(sortedCards) { card in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(card.front).font(.subheadline)
+                                Text(card.back).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if let accuracy = card.accuracy {
+                                Text("\(Int((accuracy * 100).rounded()))%")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(accuracy < 0.5 ? .red : .secondary)
+                            } else {
+                                Text("—").font(.caption).foregroundStyle(.tertiary)
+                            }
                         }
                     }
                     .onDelete(perform: deleteCards)
+                } header: {
+                    HStack {
+                        Text("카드 \(cards.count)개")
+                        Spacer()
+                        Button(weakestFirst ? "기본 순서" : "취약한 순") { weakestFirst.toggle() }
+                            .font(.caption)
+                            .disabled(cards.isEmpty)
+                    }
                 }
             }
             .navigationTitle("플래시카드")
@@ -39,7 +64,9 @@ struct FlashcardsView: View {
                 }
             }
             .onAppear { cards = FlashcardStore.all(for: folder) }
-            .sheet(isPresented: $studying) { StudyView(cards: cards) }
+            .sheet(isPresented: $studying) {
+                StudyView(cards: cards, onAnswer: recordAnswer)
+            }
         }
     }
 
@@ -51,15 +78,27 @@ struct FlashcardsView: View {
     }
 
     private func deleteCards(at offsets: IndexSet) {
-        cards.remove(atOffsets: offsets)
+        let toDelete = Set(offsets.map { sortedCards[$0].id })
+        cards.removeAll { toDelete.contains($0.id) }
+        FlashcardStore.save(cards, for: folder)
+    }
+
+    // Saved immediately after each answer (not just at the end of the session) so quitting early doesn't lose
+    // progress on the cards already reviewed.
+    private func recordAnswer(_ id: Flashcard.ID, knew: Bool) {
+        guard let i = cards.firstIndex(where: { $0.id == id }) else { return }
+        cards[i].timesStudied += 1
+        if knew { cards[i].timesKnown += 1 }
         FlashcardStore.save(cards, for: folder)
     }
 }
 
-// Flip-and-mark review, one card at a time. ponytail: no spaced-repetition scheduling (SM-2 etc.) yet — just a
-// known/unknown tally for this session. Add interval scheduling if cards need to resurface on a schedule.
+// Flip-and-mark review, one card at a time. ponytail: no spaced-repetition scheduling (SM-2 etc.) yet — cards
+// always appear in the same order and known/unknown just updates each card's overall accuracy. Add interval
+// scheduling (e.g. SM-2) if cards need to resurface on a schedule based on how well they're known.
 private struct StudyView: View {
     let cards: [Flashcard]
+    let onAnswer: (Flashcard.ID, Bool) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var index = 0
     @State private var revealed = false
@@ -102,6 +141,7 @@ private struct StudyView: View {
     }
 
     private func advance(knew: Bool) {
+        onAnswer(cards[index].id, knew)
         if knew { known += 1 }
         revealed = false
         index += 1

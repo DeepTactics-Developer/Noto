@@ -52,6 +52,25 @@ struct SearchMatch: Identifiable {
     let rect: CGRect
 }
 
+enum SearchScope: String, CaseIterable, Identifiable {
+    case both, text, handwriting
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .both: "전체"
+        case .text: "PDF 텍스트"
+        case .handwriting: "필기"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .both: "line.3.horizontal.decrease.circle"
+        case .text: "doc.text"
+        case .handwriting: "pencil.and.scribble"
+        }
+    }
+}
+
 struct NoteScreen: View {
     let folder: DocumentFolder
     let onClose: () -> Void
@@ -65,6 +84,7 @@ struct NoteScreen: View {
     @State private var showingAI = false
     @State private var showingSearch = false
     @State private var searchQuery = ""
+    @State private var searchScope: SearchScope = .both
     @State private var matches: [SearchMatch] = []
     @State private var matchIndex: Int?
     @StateObject private var model = NoteViewModel()
@@ -80,6 +100,9 @@ struct NoteScreen: View {
                     Text(folder.title).font(.subheadline.weight(.medium)).lineLimit(1).frame(maxWidth: 90, alignment: .leading)
                     if pdf != nil {
                         Divider().frame(height: 20)
+                        ToolbarIconButton(systemName: "square.and.arrow.up") { model.exportPDF?() }
+                            .accessibilityLabel("필기 포함 PDF로 내보내기")
+                        Divider().frame(height: 20)
                         toolGroup
                         Divider().frame(height: 20)
                         ToolbarIconButton(systemName: "arrow.uturn.backward") { model.undo?() }
@@ -90,8 +113,6 @@ struct NoteScreen: View {
                             Button { model.insertText?() } label: { Label("텍스트 추가", systemImage: "textformat") }
                             Button { model.insertImage?() } label: { Label("이미지 추가", systemImage: "photo") }
                             Button { model.pasteInk?() } label: { Label("필기 붙여넣기", systemImage: "doc.on.clipboard") }
-                            Divider()
-                            Button { model.exportPDF?() } label: { Label("필기 포함 PDF로 내보내기", systemImage: "square.and.arrow.up") }
                         } label: {
                             Image(systemName: "plus.circle").font(.system(size: 16)).frame(width: 30, height: 30)
                         }
@@ -101,10 +122,8 @@ struct NoteScreen: View {
                     if pdf != nil {
                         ToolbarIconButton(systemName: "magnifyingglass") { showingSearch = true }
                             .accessibilityLabel("검색")
-                        ToolbarIconButton(systemName: model.isRecording ? "mic.fill" : "mic", selected: model.isRecording) {
-                            model.toggleRecording?()
-                        }
-                        .accessibilityLabel(model.isRecording ? "녹음 중지" : "음성 녹음")
+                        MicToolbarButton(isRecording: model.isRecording, onToggle: { model.toggleRecording?() },
+                                         listContent: { RecordingList(folder: folder, model: model) })
                         ToolbarIconButton(systemName: "sparkles") { showingAI = true }
                             .accessibilityLabel("AI")
                         ToolbarIconButton(systemName: "rectangle.on.rectangle") { showingFlashcards = true }
@@ -193,6 +212,17 @@ struct NoteScreen: View {
                 .textFieldStyle(.roundedBorder)
                 .submitLabel(.search)
                 .onSubmit(runSearch)
+            Menu {
+                ForEach(SearchScope.allCases) { scope in
+                    Button { searchScope = scope; runSearch() } label: {
+                        Label(scope.label, systemImage: scope.icon)
+                        if searchScope == scope { Image(systemName: "checkmark") }
+                    }
+                }
+            } label: {
+                Image(systemName: searchScope.icon)
+            }
+            .accessibilityLabel("검색 범위: \(searchScope.label)")
             if !matches.isEmpty {
                 Text("\((matchIndex ?? 0) + 1)/\(matches.count)").font(.caption).foregroundStyle(.secondary)
                 Button { step(-1) } label: { Image(systemName: "chevron.up") }
@@ -220,7 +250,7 @@ struct NoteScreen: View {
             matchIndex = nil
             return
         }
-        matches = pdf.findString(query, withOptions: [.caseInsensitive]).compactMap { selection -> SearchMatch? in
+        matches = searchScope == .handwriting ? [] : pdf.findString(query, withOptions: [.caseInsensitive]).compactMap { selection -> SearchMatch? in
             guard let page = selection.pages.first else { return nil }
             // Unverified whether PDFKit's PDFPage.bounds(for:) already swaps width/height for a 90°/270°-rotated
             // page the way our own CGPDFPage-based sizing does elsewhere (PageViews.swift, PDFNoteViewController).
@@ -237,10 +267,10 @@ struct NoteScreen: View {
 
         // The PDF's own text is instant; handwriting recognition is not, so it's folded in once it's ready
         // instead of blocking the results the user can already see.
-        guard let searchHandwriting = model.searchHandwriting else { return }
+        guard searchScope != .text, let searchHandwriting = model.searchHandwriting else { return }
         Task {
             let inkMatches = await searchHandwriting(query)
-            guard !inkMatches.isEmpty, searchQuery.trimmingCharacters(in: .whitespaces) == query else { return }
+            guard !inkMatches.isEmpty, searchQuery.trimmingCharacters(in: .whitespaces) == query, searchScope != .text else { return }
             matches = (matches + inkMatches).sorted { $0.page < $1.page }
             if matchIndex == nil, let first = matches.first {
                 matchIndex = 0
@@ -279,6 +309,31 @@ private struct ToolbarIconButton: View {
     }
 }
 
+// A short tap starts/stops recording; a long press instead shows this page's recordings, in place of a
+// permanent sidebar tab for something used occasionally.
+private struct MicToolbarButton<ListContent: View>: View {
+    let isRecording: Bool
+    let onToggle: () -> Void
+    @ViewBuilder let listContent: () -> ListContent
+    @State private var showingList = false
+
+    var body: some View {
+        Image(systemName: isRecording ? "mic.fill" : "mic")
+            .font(.system(size: 16))
+            .frame(width: 30, height: 30)
+            .background(isRecording ? Color.accentColor.opacity(0.15) : .clear)
+            .foregroundStyle(isRecording ? Color.accentColor : Color.primary)
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onToggle)
+            .onLongPressGesture(minimumDuration: 0.45) { showingList = true }
+            .accessibilityLabel(isRecording ? "녹음 중지" : "음성 녹음, 길게 눌러 녹음 목록 보기")
+            .popover(isPresented: $showingList) {
+                listContent().frame(minWidth: 260, minHeight: 200)
+            }
+    }
+}
+
 // Floats above the page when the pen or highlighter is selected: color swatches, a custom color well, and a
 // width slider. Which fields it edits depends on which of the two tools is currently active.
 private struct ToolOptionsPill: View {
@@ -314,14 +369,13 @@ private struct ToolOptionsPill: View {
 // MARK: - Sidebar
 
 private enum SidebarTab: String, CaseIterable, Identifiable {
-    case thumbnails, outline, bookmarks, recordings
+    case thumbnails, outline, bookmarks
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .thumbnails: "square.grid.2x2"
         case .outline: "list.bullet"
         case .bookmarks: "bookmark"
-        case .recordings: "waveform"
         }
     }
 }
@@ -350,8 +404,6 @@ private struct DocumentSidebar: View {
                 OutlineList(items: pdf.flatOutline, model: model)
             case .bookmarks:
                 BookmarkList(folder: folder, bookmarks: bookmarks, model: model)
-            case .recordings:
-                RecordingList(folder: folder, model: model)
             }
         }
     }

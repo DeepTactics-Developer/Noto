@@ -43,17 +43,22 @@ struct AIAssistantView: View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(messages) { message in
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(message.question).font(.subheadline.weight(.medium))
-                                citedText(message.answer)
-                                    .font(.callout)
-                                    .foregroundStyle(message.isError ? .red : .primary)
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        if messages.isEmpty {
+                            VStack(spacing: 6) {
+                                Image(systemName: "sparkles").font(.largeTitle).foregroundStyle(.secondary)
+                                Text("이 문서에 대해 무엇이든 물어보세요").font(.subheadline).foregroundStyle(.secondary)
                             }
-                            .id(message.id)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 40)
                         }
-                        if loading { ProgressView().padding(.top, 8) }
+                        ForEach(messages) { message in
+                            questionBubble(message.question).id(message.id)
+                            answerBubble(message)
+                        }
+                        if loading {
+                            HStack { ProgressView(); Spacer() }.padding(.leading, 4)
+                        }
                     }
                     .padding(16)
                 }
@@ -79,18 +84,47 @@ struct AIAssistantView: View {
             }
             .padding(12)
         }
+        .background(Color(.systemGroupedBackground))
+    }
+
+    // The user's own question: a right-aligned bubble, like an outgoing message.
+    private func questionBubble(_ text: String) -> some View {
+        HStack {
+            Spacer(minLength: 40)
+            Text(text)
+                .font(.subheadline)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 16))
+        }
+    }
+
+    // The AI's answer: a left-aligned bubble, like an incoming message.
+    private func answerBubble(_ message: AIMessage) -> some View {
+        HStack {
+            citedText(message.answer)
+                .font(.subheadline)
+                .foregroundStyle(message.isError ? Color.red : Color.primary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+            Spacer(minLength: 40)
+        }
     }
 
     // Renders "(p.N)" tokens in the answer as tappable page-jump buttons; everything else stays plain text.
     private func citedText(_ text: String) -> some View {
         let parts = text.components(separatedBy: "(p.")
-        return VStack(alignment: .leading, spacing: 2) {
+        return VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(parts.enumerated()), id: \.offset) { offset, part in
                 if offset == 0 {
-                    Text(part)
+                    if !part.isEmpty { Text(part) }
                 } else if let closeParen = part.firstIndex(of: ")"), let page = Int(part[part.startIndex..<closeParen]) {
                     HStack(spacing: 4) {
-                        Button("p.\(page)") { onJumpToPage(page - 1) }.font(.caption.weight(.semibold))
+                        Button("p.\(page)") { onJumpToPage(page - 1) }
+                            .font(.caption.weight(.semibold))
+                            .buttonStyle(.borderless)
                         Text(String(part[part.index(after: closeParen)...]))
                     }
                 } else {

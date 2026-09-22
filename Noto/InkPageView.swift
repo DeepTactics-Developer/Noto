@@ -105,6 +105,10 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     // This page's text lines (top-left origin, page points), for the highlighter's "snap to text" setting.
     // Set by whoever owns the document; nil (or an empty result) just means the feature quietly does nothing.
     var textLineProvider: (() -> [CGRect])?
+    // Fired at the start of every touch this view itself receives — which, given ObjectsPageView sits in front
+    // and passes pencil through but claims fingers, only happens for a touch that landed on empty canvas (or a
+    // pencil touch anywhere). The owner uses this to deselect any selected text/image object.
+    var onCanvasTouch: (() -> Void)?
     private let holdSlop: CGFloat = 3 // screen points the pen may wander and still count as held
 
     // erasing
@@ -265,6 +269,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        onCanvasTouch?()
         guard activeTouch == nil, let touch = touches.first(where: { $0.type == .pencil }) else {
             super.touchesBegan(touches, with: event)
             return
@@ -456,11 +461,16 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return [] }
         let sweep = CGRect(x: CGFloat(minX), y: CGFloat(minY), width: CGFloat(maxX - minX), height: CGFloat(maxY - minY))
         let overlapped = lines.filter { $0.intersects(sweep) }
-        return overlapped.map { line in
+        return overlapped.compactMap { line -> InkStroke? in
+            // Only the part of the line actually swept, not its full width — a highlighter dragged over one
+            // word shouldn't light up the whole sentence.
+            let x0 = max(line.minX, sweep.minX)
+            let x1 = min(line.maxX, sweep.maxX)
+            guard x1 > x0 else { return nil }
             let y = Float(line.midY)
             return InkStroke(kind: .highlighter, color: color, width: Float(line.height * 0.9),
-                             points: [InkPoint(x: Float(line.minX), y: y, force: 0.5, time: 0),
-                                     InkPoint(x: Float(line.maxX), y: y, force: 0.5, time: 0.1)])
+                             points: [InkPoint(x: Float(x0), y: y, force: 0.5, time: 0),
+                                     InkPoint(x: Float(x1), y: y, force: 0.5, time: 0.1)])
         }
     }
 
@@ -522,8 +532,24 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
                 return point(p, end * Float(i) / Float(steps))
             }
         case .polygon(let corners):
+            // InkGeometry.path() smooths a quadratic curve THROUGH each interior point (it only passes exactly
+            // through the first and last), which is right for freehand ink but rounds off every corner except
+            // one if fed just the 3-4 raw corners. Resampling each edge densely keeps consecutive points close
+            // to colinear, so that same smoothing stays imperceptibly close to straight — the same trick the
+            // ellipse case above already relies on for its curve.
             let closed = corners + [corners[0]]
-            return closed.enumerated().map { i, p in point(p, end * Float(i) / Float(closed.count - 1)) }
+            let perEdge = 24
+            var dense: [CGPoint] = []
+            for i in 0..<(closed.count - 1) {
+                let a = closed[i], b = closed[i + 1]
+                for k in 0..<perEdge {
+                    let t = CGFloat(k) / CGFloat(perEdge)
+                    dense.append(CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t))
+                }
+            }
+            dense.append(closed[closed.count - 1])
+            let n = dense.count
+            return dense.enumerated().map { i, p in point(p, end * Float(i) / Float(max(n - 1, 1))) }
         }
     }
 
@@ -967,4 +993,15 @@ private final class SelectionHandleView: UIView {
     }
 
     @objc private func handlePan(_ gesture: UIPanGestureRecognizer) { onPan?(gesture) }
+
+    // This view has no touchesBegan override of its own, so by default an unrecognized touch here (the brief
+    // window before the pan gesture above has moved enough to recognize) forwards up the responder chain —
+    // through `host` and into InkPageView's own touchesBegan, which for a pencil touch immediately reads it as
+    // "empty canvas, start a new lasso," clearing the very selection this handle belongs to. Swallowing the
+    // touch here (never calling super) keeps it local to this view's own pan gesture, which is what actually
+    // drives resize/rotate for both finger and pencil.
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {}
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {}
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {}
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {}
 }
