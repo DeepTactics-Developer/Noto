@@ -32,6 +32,7 @@ final class NoteViewModel: ObservableObject {
     @Published var currentPage = 0
     @Published var sidebarVisible = true
     @Published var toolState = ToolState()
+    @Published var isRecording = false
     var toolStateDidChange: (() -> Void)?
     var undo: (() -> Void)?
     var redo: (() -> Void)?
@@ -41,6 +42,8 @@ final class NoteViewModel: ObservableObject {
     var insertImage: (() -> Void)?
     var pasteInk: (() -> Void)?
     var exportPDF: (() -> Void)?
+    var toggleRecording: (() -> Void)?
+    var searchHandwriting: ((String) async -> [SearchMatch])?
 }
 
 struct SearchMatch: Identifiable {
@@ -58,6 +61,8 @@ struct NoteScreen: View {
     @State private var bookmarks: Set<Int> = []
     @State private var errorText: String?
     @State private var showingSettings = false
+    @State private var showingFlashcards = false
+    @State private var showingAI = false
     @State private var showingSearch = false
     @State private var searchQuery = ""
     @State private var matches: [SearchMatch] = []
@@ -96,11 +101,14 @@ struct NoteScreen: View {
                     if pdf != nil {
                         ToolbarIconButton(systemName: "magnifyingglass") { showingSearch = true }
                             .accessibilityLabel("검색")
-                        // Recording and AI aren't built yet — shown so the layout already has their place, greyed out.
-                        ToolbarIconButton(systemName: "mic", disabled: true) {}
-                            .accessibilityLabel("음성 녹음, 준비 중")
-                        ToolbarIconButton(systemName: "sparkles", disabled: true) {}
-                            .accessibilityLabel("AI, 준비 중")
+                        ToolbarIconButton(systemName: model.isRecording ? "mic.fill" : "mic", selected: model.isRecording) {
+                            model.toggleRecording?()
+                        }
+                        .accessibilityLabel(model.isRecording ? "녹음 중지" : "음성 녹음")
+                        ToolbarIconButton(systemName: "sparkles") { showingAI = true }
+                            .accessibilityLabel("AI")
+                        ToolbarIconButton(systemName: "rectangle.on.rectangle") { showingFlashcards = true }
+                            .accessibilityLabel("플래시카드")
                         Divider().frame(height: 20)
                         ToolbarIconButton(systemName: bookmarks.contains(model.currentPage) ? "bookmark.fill" : "bookmark", action: toggleBookmark)
                             .accessibilityLabel("이 페이지 북마크")
@@ -144,6 +152,10 @@ struct NoteScreen: View {
             }
         }
         .sheet(isPresented: $showingSettings) { SettingsView() }
+        .sheet(isPresented: $showingFlashcards) { FlashcardsView(folder: folder) }
+        .sheet(isPresented: $showingAI) {
+            if let pdf { AIAssistantView(document: pdf, onJumpToPage: { model.scrollToPage?($0) }) }
+        }
         .onAppear(perform: load)
         .onChange(of: model.toolState) { _, _ in model.toolStateDidChange?() }
     }
@@ -222,6 +234,19 @@ struct NoteScreen: View {
         .sorted { $0.page < $1.page }
         matchIndex = matches.isEmpty ? nil : 0
         if let first = matches.first { model.showMatch?(first.page, first.rect) }
+
+        // The PDF's own text is instant; handwriting recognition is not, so it's folded in once it's ready
+        // instead of blocking the results the user can already see.
+        guard let searchHandwriting = model.searchHandwriting else { return }
+        Task {
+            let inkMatches = await searchHandwriting(query)
+            guard !inkMatches.isEmpty, searchQuery.trimmingCharacters(in: .whitespaces) == query else { return }
+            matches = (matches + inkMatches).sorted { $0.page < $1.page }
+            if matchIndex == nil, let first = matches.first {
+                matchIndex = 0
+                model.showMatch?(first.page, first.rect)
+            }
+        }
     }
 
     private func step(_ delta: Int) {
@@ -289,13 +314,14 @@ private struct ToolOptionsPill: View {
 // MARK: - Sidebar
 
 private enum SidebarTab: String, CaseIterable, Identifiable {
-    case thumbnails, outline, bookmarks
+    case thumbnails, outline, bookmarks, recordings
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .thumbnails: "square.grid.2x2"
         case .outline: "list.bullet"
         case .bookmarks: "bookmark"
+        case .recordings: "waveform"
         }
     }
 }
@@ -324,6 +350,8 @@ private struct DocumentSidebar: View {
                 OutlineList(items: pdf.flatOutline, model: model)
             case .bookmarks:
                 BookmarkList(folder: folder, bookmarks: bookmarks, model: model)
+            case .recordings:
+                RecordingList(folder: folder, model: model)
             }
         }
     }
@@ -449,6 +477,54 @@ private struct BookmarkList: View {
                 .padding(8)
             }
         }
+    }
+}
+
+private struct RecordingList: View {
+    let folder: DocumentFolder
+    @ObservedObject var model: NoteViewModel
+    @StateObject private var player = RecordingPlayer()
+    @State private var recordings: [Recording] = []
+
+    var body: some View {
+        ScrollView {
+            if recordings.isEmpty {
+                SidebarEmptyState(icon: "waveform", text: "녹음이 없습니다")
+            } else {
+                LazyVStack(spacing: 10) {
+                    ForEach(recordings) { recording in
+                        HStack(spacing: 8) {
+                            Button { player.toggle(recording, folder: folder) } label: {
+                                Image(systemName: player.playingID == recording.id ? "stop.circle.fill" : "play.circle.fill")
+                                    .font(.title3)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("페이지 \(recording.pageIndex + 1)").font(.caption)
+                                Text(formatted(recording.duration)).font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button { model.scrollToPage?(recording.pageIndex) } label: { Image(systemName: "arrow.right.circle") }
+                            Button(role: .destructive) {
+                                RecordingStore.delete(recording.id, for: folder)
+                                recordings = RecordingStore.all(for: folder)
+                            } label: { Image(systemName: "trash") }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption)
+                    }
+                }
+                .padding(8)
+            }
+        }
+        .onAppear { recordings = RecordingStore.all(for: folder) }
+        .onChange(of: model.isRecording) { _, isRecording in
+            if !isRecording { recordings = RecordingStore.all(for: folder) } // refresh right after a stop
+        }
+    }
+
+    private func formatted(_ duration: TimeInterval) -> String {
+        let seconds = Int(duration.rounded())
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }
 

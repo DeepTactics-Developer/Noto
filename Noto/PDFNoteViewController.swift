@@ -17,6 +17,8 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
     private let model: NoteViewModel
     private var imagePickerPage: Int?
     private var textLineCache: [Int: [CGRect]] = [:] // per page, for the highlighter's "snap to text" setting
+    private var handwritingCache: [Int: [(text: String, rect: CGRect)]] = [:] // per page, for handwriting search
+    private let recorder = VoiceRecorder()
 
     private let scrollView = UIScrollView()
     private let contentView = UIView()
@@ -52,7 +54,10 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         super.init(nibName: nil, bundle: nil)
         previews.totalCostLimit = 120_000_000
         store.undoManager = { [weak self] in self?.undoManager }
-        store.onChange = { [weak self] page in self?.live[page]?.ink.sync() }
+        store.onChange = { [weak self] page in
+            self?.live[page]?.ink.sync()
+            self?.handwritingCache[page] = nil
+        }
         store.onSaveError = { [weak self] error in self?.reportSaveFailure(error) }
         objectStore.undoManager = { [weak self] in self?.undoManager }
         objectStore.onChange = { [weak self] page in self?.live[page]?.objects.sync() }
@@ -91,6 +96,49 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         model.toolStateDidChange = { [weak self] in self?.applyToolState() }
         model.undo = { [weak self] in self?.undoManager?.undo() }
         model.redo = { [weak self] in self?.undoManager?.redo() }
+        model.toggleRecording = { [weak self] in self?.toggleRecording() }
+        model.searchHandwriting = { [weak self] query in await self?.searchHandwriting(query) ?? [] }
+        recorder.onFinish = { [weak self] filename, duration in
+            guard let self else { return }
+            RecordingStore.add(filename: filename, pageIndex: model.currentPage, duration: duration, for: folder)
+            model.isRecording = false
+        }
+        recorder.onError = { [weak self] error in
+            self?.model.isRecording = false
+            self?.reportSaveFailure(error)
+        }
+    }
+
+    // MARK: Recording
+
+    private func toggleRecording() {
+        if recorder.isRecording {
+            recorder.stop()
+        } else {
+            model.isRecording = true
+            recorder.start(in: folder)
+        }
+    }
+
+    // MARK: Handwriting search
+
+    private func searchHandwriting(_ query: String) async -> [SearchMatch] {
+        let needle = query.lowercased()
+        guard !needle.isEmpty else { return [] }
+        var results: [SearchMatch] = []
+        for index in pages.indices {
+            let hits: [(text: String, rect: CGRect)]
+            if let cached = handwritingCache[index] {
+                hits = cached
+            } else {
+                hits = await HandwritingSearch.recognize(strokes: store.strokes(on: index), pageSize: pageSizes[index])
+                handwritingCache[index] = hits
+            }
+            for hit in hits where hit.text.lowercased().contains(needle) {
+                results.append(SearchMatch(page: index, rect: hit.rect))
+            }
+        }
+        return results
     }
 
     // MARK: Search
