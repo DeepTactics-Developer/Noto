@@ -102,6 +102,9 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private var holdTried = false
     private var holdDelay: TimeInterval = 0.5
     private var snapped: RecognizedShape?
+    // This page's text lines (top-left origin, page points), for the highlighter's "snap to text" setting.
+    // Set by whoever owns the document; nil (or an empty result) just means the feature quietly does nothing.
+    var textLineProvider: (() -> [CGRect])?
     private let holdSlop: CGFloat = 3 // screen points the pen may wander and still count as held
 
     // erasing
@@ -424,11 +427,41 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
             withoutAnimation { live.group.removeFromSuperlayer() }
             return
         }
+        let textSnapped = style.kind == .highlighter && snapped == nil && AppSettings.highlighterTextSnap
+            ? snappedHighlightStrokes(sweeping: points, color: style.color, lines: textLineProvider?() ?? [])
+            : []
+        if !textSnapped.isEmpty {
+            withoutAnimation { live.group.removeFromSuperlayer() } // discard the freehand preview; these replace it
+            for stroke in textSnapped {
+                let strokeLayers = makeLayers(for: stroke)
+                withoutAnimation { host.layer.addSublayer(strokeLayers.group) }
+                layers[stroke.id] = strokeLayers
+                store.add(stroke, on: page)
+            }
+            return
+        }
         let pressure = snapped == nil ? style.pressure : 0 // snapped shapes have a constant width
         let stroke = InkStroke(kind: style.kind, color: style.color, width: style.width, pressure: pressure, points: points)
         withoutAnimation { live.update(points: stroke.points, color: stroke.color, width: stroke.width, pressure: stroke.pressure) }
         layers[stroke.id] = live // the live layers become the stroke's layers, so sync() keeps them
         store.add(stroke, on: page)
+    }
+
+    // One flat, constant-width stroke per text line the highlighter's stroke swept over — this is what makes
+    // a highlighter drawn loosely over a line of text come out looking like it exactly covers that line,
+    // the way it would on paper. Only for documents that actually have a text layer (real text or OCR'd);
+    // `textLineProvider` reports no lines otherwise, so this quietly falls back to the freehand stroke.
+    private func snappedHighlightStrokes(sweeping points: [InkPoint], color: [Float], lines: [CGRect]) -> [InkStroke] {
+        let xs = points.map(\.x), ys = points.map(\.y)
+        guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return [] }
+        let sweep = CGRect(x: CGFloat(minX), y: CGFloat(minY), width: CGFloat(maxX - minX), height: CGFloat(maxY - minY))
+        let overlapped = lines.filter { $0.intersects(sweep) }
+        return overlapped.map { line in
+            let y = Float(line.midY)
+            return InkStroke(kind: .highlighter, color: color, width: Float(line.height * 0.9),
+                             points: [InkPoint(x: Float(line.minX), y: y, force: 0.5, time: 0),
+                                     InkPoint(x: Float(line.maxX), y: y, force: 0.5, time: 0.1)])
+        }
     }
 
     // MARK: Hold to shape
@@ -465,6 +498,9 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         case .ellipse(let center, let rx, let ry, let angle):
             path.addEllipse(in: CGRect(x: -rx, y: -ry, width: 2 * rx, height: 2 * ry),
                             transform: CGAffineTransform(translationX: center.x, y: center.y).rotated(by: angle))
+        case .polygon(let corners):
+            path.addLines(between: corners)
+            path.closeSubpath()
         }
         withoutAnimation { wet.show(path: path, color: style.color, width: style.width) }
     }
@@ -485,6 +521,9 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
                 let p = CGPoint(x: center.x + x * cos(angle) - y * sin(angle), y: center.y + x * sin(angle) + y * cos(angle))
                 return point(p, end * Float(i) / Float(steps))
             }
+        case .polygon(let corners):
+            let closed = corners + [corners[0]]
+            return closed.enumerated().map { i, p in point(p, end * Float(i) / Float(closed.count - 1)) }
         }
     }
 

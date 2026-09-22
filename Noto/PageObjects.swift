@@ -140,6 +140,21 @@ final class ObjectStore {
             }
         }
     }
+
+    // removeImage leaves the file on disk (see its comment) so an undo never points at a missing file; this
+    // sweeps whatever no page still references. Reads every page's .objects file, so it's meant for a natural
+    // pause point (closing the document), not something to run on every edit.
+    func sweepOrphanedImages(pageCount: Int) {
+        var referenced = Set<String>()
+        for page in 0..<pageCount {
+            for image in objects(on: page).images { referenced.insert(image.filename) }
+        }
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: folder.url, includingPropertiesForKeys: nil) else { return }
+        for file in files where file.lastPathComponent.hasPrefix("image_") && !referenced.contains(file.lastPathComponent) {
+            try? fm.removeItem(at: file)
+        }
+    }
 }
 
 // A view whose empty areas never claim a touch, so it can cover a region wider than its actual content
@@ -324,6 +339,14 @@ final class TextBoxView: UIView, UITextViewDelegate {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
+    // The pencil is reserved for drawing/erasing/lasso everywhere else in the app; only fingers drag or edit
+    // an object. So a pencil touch here passes straight through to whatever's behind it (normally ink), instead
+    // of this box swallowing it just because it happens to sit on top.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if let touches = event?.allTouches, touches.contains(where: { $0.type == .pencil }) { return nil }
+        return super.hitTest(point, with: event)
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         handle.frame = CGRect(x: 0, y: 0, width: bounds.width, height: handleHeight)
@@ -406,6 +429,12 @@ final class ImageBoxView: UIView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    // See the matching override on TextBoxView: a pencil touch always draws through to whatever's behind this.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if let touches = event?.allTouches, touches.contains(where: { $0.type == .pencil }) { return nil }
+        return super.hitTest(point, with: event)
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()

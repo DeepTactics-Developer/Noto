@@ -23,6 +23,7 @@ enum AppSettings {
         static let pressureSensitivity = "pressureSensitivity"
         static let eraserMode = "eraserMode"
         static let eraserSize = "eraserSize"
+        static let highlighterTextSnap = "highlighterTextSnap"
     }
 
     static var shapeSnap: Bool { UserDefaults.standard.object(forKey: Key.shapeSnap) as? Bool ?? true }
@@ -31,6 +32,7 @@ enum AppSettings {
     static var pressureSensitivity: Double { UserDefaults.standard.object(forKey: Key.pressureSensitivity) as? Double ?? 0.6 }
     static var eraserMode: EraserMode { EraserMode(rawValue: UserDefaults.standard.string(forKey: Key.eraserMode) ?? "") ?? .partial }
     static var eraserSize: Double { UserDefaults.standard.object(forKey: Key.eraserSize) as? Double ?? 12 } // radius in screen points
+    static var highlighterTextSnap: Bool { UserDefaults.standard.object(forKey: Key.highlighterTextSnap) as? Bool ?? true }
 }
 
 struct SettingsView: View {
@@ -40,6 +42,7 @@ struct SettingsView: View {
     @AppStorage(AppSettings.Key.shapeSnap) private var shapeSnap = true
     @AppStorage(AppSettings.Key.holdDelay) private var holdDelay = 0.5
     @AppStorage(AppSettings.Key.eraserMode) private var eraser = EraserMode.partial.rawValue
+    @AppStorage(AppSettings.Key.highlighterTextSnap) private var highlighterTextSnap = true
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -68,6 +71,14 @@ struct SettingsView: View {
                     }
                 } header: {
                     Text("도형 자동 변환")
+                }
+
+                Section {
+                    Toggle("텍스트에 맞춰 자동 정렬", isOn: $highlighterTextSnap)
+                } header: {
+                    Text("형광펜")
+                } footer: {
+                    Text("텍스트가 있는 PDF(스캔본은 OCR이 된 경우)에서 줄 위를 대충 그어도 그 줄 전체에 깔끔하게 맞춰 그어집니다. 텍스트가 없는 페이지에서는 손으로 그린 그대로 그어집니다.")
                 }
 
                 Section {

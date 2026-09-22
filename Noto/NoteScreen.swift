@@ -40,6 +40,7 @@ final class NoteViewModel: ObservableObject {
     var insertText: (() -> Void)?
     var insertImage: (() -> Void)?
     var pasteInk: (() -> Void)?
+    var exportPDF: (() -> Void)?
 }
 
 struct SearchMatch: Identifiable {
@@ -84,6 +85,8 @@ struct NoteScreen: View {
                             Button { model.insertText?() } label: { Label("텍스트 추가", systemImage: "textformat") }
                             Button { model.insertImage?() } label: { Label("이미지 추가", systemImage: "photo") }
                             Button { model.pasteInk?() } label: { Label("필기 붙여넣기", systemImage: "doc.on.clipboard") }
+                            Divider()
+                            Button { model.exportPDF?() } label: { Label("필기 포함 PDF로 내보내기", systemImage: "square.and.arrow.up") }
                         } label: {
                             Image(systemName: "plus.circle").font(.system(size: 16)).frame(width: 30, height: 30)
                         }

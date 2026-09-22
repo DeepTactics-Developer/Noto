@@ -16,6 +16,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
     private let objectStore: ObjectStore
     private let model: NoteViewModel
     private var imagePickerPage: Int?
+    private var textLineCache: [Int: [CGRect]] = [:] // per page, for the highlighter's "snap to text" setting
 
     private let scrollView = UIScrollView()
     private let contentView = UIView()
@@ -86,6 +87,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         model.insertText = { [weak self] in self?.insertText() }
         model.insertImage = { [weak self] in self?.presentImagePicker() }
         model.pasteInk = { [weak self] in self?.pasteInk() }
+        model.exportPDF = { [weak self] in self?.exportAndShare() }
         model.toolStateDidChange = { [weak self] in self?.applyToolState() }
         model.undo = { [weak self] in self?.undoManager?.undo() }
         model.redo = { [weak self] in self?.undoManager?.redo() }
@@ -161,6 +163,111 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         live[page]?.objects.insertImage(image, filename: filename, at: visibleCenter(on: page))
     }
 
+    // MARK: Text lines (for the highlighter's "snap to text" setting)
+
+    private func textLines(on pageIndex: Int) -> [CGRect] {
+        if let cached = textLineCache[pageIndex] { return cached }
+        let lines = computeTextLines(on: pageIndex)
+        textLineCache[pageIndex] = lines
+        return lines
+    }
+
+    private func computeTextLines(on pageIndex: Int) -> [CGRect] {
+        guard let pdfPage = document.page(at: pageIndex) else { return [] }
+        let count = pdfPage.numberOfCharacters
+        guard count > 0 else { return [] }
+        let bottomLeftBounds = (0..<count).map { pdfPage.characterBounds(at: $0) }
+        let naturalHeight = pageSizes[pageIndex].height
+        guard naturalHeight > 0 else { return [] }
+        // Same bottom-left -> top-left flip already confirmed correct for the search highlight.
+        return TextLineLayout.lines(fromCharacterBounds: bottomLeftBounds).map {
+            CGRect(x: $0.minX, y: naturalHeight - $0.maxY, width: $0.width, height: $0.height)
+        }
+    }
+
+    // MARK: Export
+
+    struct ExportError: LocalizedError {
+        var errorDescription: String? { "PDF를 만들지 못했습니다." }
+    }
+
+    // Every page of the original PDF, redrawn with the ink, text boxes and images on top, as one flat PDF —
+    // independent of whatever's currently scrolled into view (`pages`/`pageSizes` cover the whole document,
+    // unlike the virtualized `live` dict).
+    private func exportFlattenedPDF() -> URL? {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(folder.title).pdf")
+        try? FileManager.default.removeItem(at: url)
+        do {
+            try UIGraphicsPDFRenderer(bounds: .zero).writePDF(to: url) { context in
+                for index in pages.indices {
+                    let size = pageSizes[index]
+                    context.beginPage(withBounds: CGRect(origin: .zero, size: size), pageInfo: [:])
+                    let cg = context.cgContext
+                    PDFRenderer.draw(pages[index], in: cg, size: size)
+                    drawInk(on: index, in: cg)
+                    drawObjects(on: index, in: cg)
+                }
+            }
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    // Same top-left-origin, UIKit-style context PDFRenderer.draw already assumes (UIGraphicsPDFRenderer, like
+    // UIGraphicsImageRenderer, hands out contexts in that convention — no extra flip needed here).
+    private func drawInk(on page: Int, in ctx: CGContext) {
+        for stroke in store.strokes(on: page) {
+            let color = InkStroke.uiColor(stroke.color).cgColor
+            for run in InkGeometry.runs(of: stroke.points, width: stroke.width, pressure: stroke.pressure) {
+                ctx.setStrokeColor(color)
+                ctx.setLineWidth(run.width)
+                ctx.setLineCap(.round)
+                ctx.setLineJoin(.round)
+                ctx.addPath(InkGeometry.path(run.points))
+                ctx.strokePath()
+            }
+        }
+    }
+
+    private func drawObjects(on page: Int, in ctx: CGContext) {
+        let objects = objectStore.objects(on: page)
+        for box in objects.textBoxes {
+            let attributed = NSAttributedString(string: box.text, attributes: [
+                .font: UIFont.systemFont(ofSize: box.fontSize), .foregroundColor: UIColor.black,
+            ])
+            ctx.saveGState()
+            UIGraphicsPushContext(ctx)
+            attributed.draw(in: box.frame.insetBy(dx: 4, dy: 4))
+            UIGraphicsPopContext()
+            ctx.restoreGState()
+        }
+        for box in objects.images {
+            guard let data = try? Data(contentsOf: folder.fileURL(box.filename)), let cgImage = UIImage(data: data)?.cgImage else { continue }
+            ctx.saveGState()
+            // CGContext.draw(_:in:) always draws an image bottom-to-top regardless of the context's own flip
+            // state, so it needs this local flip to come out right-side up here — text (drawn above) doesn't.
+            ctx.translateBy(x: box.frame.minX, y: box.frame.minY + box.frame.height)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.draw(cgImage, in: CGRect(origin: .zero, size: box.frame.size))
+            ctx.restoreGState()
+        }
+    }
+
+    private func exportAndShare() {
+        guard let url = exportFlattenedPDF() else {
+            reportSaveFailure(ExportError())
+            return
+        }
+        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let popover = activity.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: 0, width: 1, height: 1)
+            popover.permittedArrowDirections = [.up]
+        }
+        present(activity, animated: true)
+    }
+
     // Called by the thumbnail sidebar. scrollRectToVisible only guarantees the rect becomes visible with the
     // least motion, which for a page taller than the viewport can land on its bottom half (or even leave the
     // scroll short of the page, reading as the wrong page). Converting the page's top through the content view
@@ -211,6 +318,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         flush()
+        objectStore.sweepOrphanedImages(pageCount: pages.count)
         resignFirstResponder()
     }
 
@@ -228,6 +336,28 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        layOutForCurrentWidth()
+    }
+
+    // A device rotation (or split-view resize) normally reaches this only through viewDidLayoutSubviews, which
+    // fires as a discrete jump once the system's own rotation animation has already finished — the page
+    // snapping into its new position a beat after everything else has visibly stopped moving is what read as
+    // awkward. Doing the same relayout inside the transition coordinator's own animation block instead makes it
+    // happen smoothly, in step with the system rotation, using the exact API Apple documents for this.
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        live.values.forEach { $0.beginResize(renderZoom: 1) } // before the pages change size
+        coordinator.animate(alongsideTransition: { [weak self] _ in
+            self?.layOutForCurrentWidth()
+        }, completion: { [weak self] _ in
+            self?.layoutVisiblePages()
+            self?.updateCurrentPage()
+        })
+    }
+
+    // Shared by both paths above; viewDidLayoutSubviews' own width check makes this a no-op if the transition
+    // coordinator's block already did it for the current width.
+    private func layOutForCurrentWidth() {
         let width = scrollView.bounds.width
         guard width > 0, width != laidOutWidth else { return }
         let anchor = anchorAtTop()
@@ -290,6 +420,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         let view = PageView(page: pages[index], pageSize: pageSizes[index], index: index, store: store, objectStore: objectStore)
         view.frame = frames[index]
         view.ink.mode = mode
+        view.ink.textLineProvider = { [weak self] in self?.textLines(on: index) ?? [] }
         view.setRenderZoom(renderZoom)
         contentView.addSubview(view)
         contentView.sendSubviewToBack(view) // pages never overlap each other, but this keeps overlays (search highlight) on top
