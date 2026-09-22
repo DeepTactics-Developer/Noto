@@ -12,7 +12,10 @@ enum RecognizedShape: Equatable {
 enum ShapeRecognizer {
     static func recognize(_ points: [CGPoint]) -> RecognizedShape? {
         guard points.count >= 3 else { return nil }
-        return line(points) ?? ellipse(points) ?? polygon(points)
+        // Polygon detection requires sharp, well-separated corners, so it's specific enough to try before the
+        // looser ellipse fit — otherwise an axis-aligned rectangle's error can fall inside the ellipse tolerance
+        // and get misclassified as a circle/ellipse before polygon() ever runs.
+        return line(points) ?? polygon(points) ?? ellipse(points)
     }
 
     static func pathLength(_ points: [CGPoint]) -> CGFloat {
