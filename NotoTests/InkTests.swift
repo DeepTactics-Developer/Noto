@@ -109,6 +109,38 @@ final class InkTests: XCTestCase {
         XCTAssertEqual(moved.points.map(\.y), [-2, 3])
     }
 
+    func testTransformedScalesPointsAndWidthAroundTheOrigin() {
+        let original = stroke([(0, 0), (10, 0)], width: 2)
+        let scaled = original.transformed(by: CGAffineTransform(scaleX: 2, y: 2))
+        XCTAssertNotEqual(scaled.id, original.id)
+        XCTAssertEqual(scaled.points.map(\.x), [0, 20])
+        XCTAssertEqual(scaled.width, 4)
+    }
+
+    func testTransformedRotationLeavesWidthUnchanged() {
+        let original = stroke([(1, 0)], width: 3)
+        let rotated = original.transformed(by: CGAffineTransform(rotationAngle: .pi / 2))
+        XCTAssertEqual(rotated.points[0].x, 0, accuracy: 0.0001)
+        XCTAssertEqual(rotated.points[0].y, 1, accuracy: 0.0001)
+        XCTAssertEqual(rotated.width, 3)
+    }
+
+    func testClipboardPasteRecentersAroundTheGivenPointWithFreshIDs() {
+        let original = stroke([(0, 0), (10, 10)])
+        InkClipboard.copy([original])
+        let pasted = InkClipboard.pasteStrokes(centeredAt: CGPoint(x: 100, y: 100))
+        XCTAssertEqual(pasted.count, 1)
+        XCTAssertNotEqual(pasted[0].id, original.id)
+        XCTAssertEqual(pasted[0].bounds.midX, 100, accuracy: 0.01)
+        XCTAssertEqual(pasted[0].bounds.midY, 100, accuracy: 0.01)
+    }
+
+    func testClipboardIsEmptyUntilSomethingIsCopied() {
+        InkClipboard.copy([])
+        XCTAssertTrue(InkClipboard.isEmpty)
+        XCTAssertTrue(InkClipboard.pasteStrokes(centeredAt: .zero).isEmpty)
+    }
+
     func testMalformedStrokeIsRejected() throws {
         let broken: [String: Any] = [
             "version": 1,

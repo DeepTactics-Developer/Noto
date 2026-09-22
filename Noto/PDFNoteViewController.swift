@@ -89,6 +89,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         model.showMatch = { [weak self] page, rect in self?.flashHighlight(page: page, rectInPage: rect) }
         model.insertText = { [weak self] in self?.insertText() }
         model.insertImage = { [weak self] in self?.presentImagePicker() }
+        model.pasteInk = { [weak self] in self?.pasteInk() }
     }
 
     // MARK: Search
@@ -122,6 +123,11 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     private func insertText() {
         let page = model.currentPage
         live[page]?.objects.insertText(at: visibleCenter(on: page))
+    }
+
+    private func pasteInk() {
+        let page = model.currentPage
+        live[page]?.ink.pasteClipboard(at: visibleCenter(on: page))
     }
 
     private func presentImagePicker() {
@@ -288,6 +294,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         view.ink.mode = mode
         view.setRenderZoom(renderZoom)
         contentView.addSubview(view)
+        contentView.sendSubviewToBack(view) // pages never overlap each other, but this keeps overlays (search highlight) on top
         live[index] = view
         loadPreview(for: index, into: view)
     }

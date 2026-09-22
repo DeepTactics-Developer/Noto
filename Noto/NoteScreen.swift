@@ -9,6 +9,7 @@ final class NoteViewModel: ObservableObject {
     var showMatch: ((Int, CGRect) -> Void)? // page index, rect in that page's own point space (top-left origin)
     var insertText: (() -> Void)?
     var insertImage: (() -> Void)?
+    var pasteInk: (() -> Void)?
 }
 
 struct SearchMatch: Identifiable {
@@ -49,6 +50,7 @@ struct NoteScreen: View {
                         Menu {
                             Button { model.insertText?() } label: { Label("텍스트 추가", systemImage: "textformat") }
                             Button { model.insertImage?() } label: { Label("이미지 추가", systemImage: "photo") }
+                            Button { model.pasteInk?() } label: { Label("필기 붙여넣기", systemImage: "doc.on.clipboard") }
                         } label: {
                             Image(systemName: "plus.circle")
                         }
@@ -146,7 +148,10 @@ struct NoteScreen: View {
         }
         matches = pdf.findString(query, withOptions: [.caseInsensitive]).compactMap { selection -> SearchMatch? in
             guard let page = selection.pages.first else { return nil }
-            let natural = page.bounds(for: .cropBox).size // PDFKit already accounts for the page's own rotation here
+            // Unverified whether PDFKit's PDFPage.bounds(for:) already swaps width/height for a 90°/270°-rotated
+            // page the way our own CGPDFPage-based sizing does elsewhere (PageViews.swift, PDFNoteViewController).
+            // If a highlight lands wrong specifically on a rotated PDF, check this first.
+            let natural = page.bounds(for: .cropBox).size
             guard natural.height > 0 else { return nil }
             let bottomLeft = selection.bounds(for: page) // origin bottom-left, PDF's own convention
             let topLeft = CGRect(x: bottomLeft.minX, y: natural.height - bottomLeft.maxY, width: bottomLeft.width, height: bottomLeft.height)

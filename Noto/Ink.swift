@@ -49,6 +49,19 @@ struct InkStroke: Identifiable, Codable {
         })
     }
 
+    // The same stroke scaled and/or rotated (lasso resize/rotate handles). Width scales with the transform's
+    // magnitude so a bigger shape doesn't end up with a relatively hairline outline.
+    func transformed(by transform: CGAffineTransform) -> InkStroke {
+        let scaleFactor = sqrt(transform.a * transform.a + transform.b * transform.b)
+        return InkStroke(kind: kind, color: color, width: width * Float(scaleFactor), pressure: pressure, points: points.map {
+            let moved = CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)).applying(transform)
+            var p = $0
+            p.x = Float(moved.x)
+            p.y = Float(moved.y)
+            return p
+        })
+    }
+
     private static func bounds(of points: [InkPoint]) -> CGRect {
         guard let first = points.first else { return .null }
         var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
@@ -236,5 +249,25 @@ enum InkGeometry {
     static func isSelected(_ stroke: InkStroke, by lasso: CGPath) -> Bool {
         let inside = stroke.points.filter { lasso.contains($0.cg, using: .evenOdd) }.count
         return inside * 2 >= stroke.points.count
+    }
+}
+
+// A lasso "copy" simply remembers the strokes; "paste" re-centers them wherever the user pastes, on any page
+// of any open document, the same way the system pasteboard works. Kept in memory only — nothing to persist.
+enum InkClipboard {
+    private static var strokes: [InkStroke] = []
+
+    static var isEmpty: Bool { strokes.isEmpty }
+
+    static func copy(_ strokes: [InkStroke]) {
+        self.strokes = strokes
+    }
+
+    static func pasteStrokes(centeredAt center: CGPoint) -> [InkStroke] {
+        guard !strokes.isEmpty else { return [] }
+        var box = strokes[0].bounds
+        for stroke in strokes.dropFirst() { box = box.union(stroke.bounds) }
+        let offset = CGSize(width: center.x - box.midX, height: center.y - box.midY)
+        return strokes.map { $0.moved(by: offset) } // moved(by:) already mints a fresh id per stroke
     }
 }

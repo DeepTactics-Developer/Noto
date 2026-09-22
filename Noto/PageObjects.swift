@@ -181,6 +181,15 @@ final class ObjectsPageView: UIView {
         if first { UIView.performWithoutAnimation(apply) } else { apply() } // later changes animate with a rotation
     }
 
+    // This view covers the whole page so its children can sit anywhere on it, but that would otherwise also
+    // make it claim every touch on empty parts of the page — including pencil touches meant for ink underneath,
+    // and finger touches meant for the scroll view. Only let an actual text/image child claim a touch; an empty
+    // area falls through to whatever is behind this view.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hit = super.hitTest(point, with: event)
+        return hit === self ? nil : hit
+    }
+
     // Brings the views in line with the store: adds missing objects, drops deleted ones, refreshes edits.
     // Frames of objects the user is actively dragging are left alone, so this doesn't fight their finger.
     func sync() {
@@ -295,7 +304,8 @@ final class TextBoxView: UIView, UITextViewDelegate {
 
         textView.text = text
         textView.isScrollEnabled = false
-        textView.backgroundColor = .white
+        textView.backgroundColor = .clear
+        textView.isOpaque = false
         textView.textContainerInset = UIEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
         textView.layer.borderColor = UIColor.separator.cgColor
         textView.layer.borderWidth = 0.5
@@ -368,7 +378,8 @@ final class ImageBoxView: UIView {
         super.init(frame: .zero)
         imageView.image = image
         imageView.contentMode = .scaleAspectFit
-        imageView.backgroundColor = .white
+        imageView.backgroundColor = .clear
+        imageView.isOpaque = false
         imageView.layer.borderColor = UIColor.separator.cgColor
         imageView.layer.borderWidth = 0.5
         addSubview(imageView)

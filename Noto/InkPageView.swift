@@ -72,6 +72,8 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         case erasing(partial: Bool, radius: CGFloat)
         case lassoing
         case moving
+        case resizing
+        case rotating
     }
 
     private let page: Int
@@ -116,6 +118,16 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private var dragOffset = CGSize.zero
     private var menu: UIEditMenuInteraction?
 
+    // resize (bottom-right handle, opposite corner as pivot) / rotate (handle above top-center, pivot = center)
+    private let resizeHandle = NoActionShapeLayer()
+    private let rotateHandle = NoActionShapeLayer()
+    private let rotateHandleLine = NoActionShapeLayer()
+    private var transformPivot = CGPoint.zero
+    private var transformStartVector = CGPoint.zero
+    private var pendingTransform = CGAffineTransform.identity
+    private let handleReach: CGFloat = 14 // screen points
+    private let rotateHandleOffset: CGFloat = 28 // screen points, above the selection
+
     init(page: Int, pageSize: CGSize, store: InkStore) {
         self.page = page
         self.pageSize = pageSize
@@ -141,6 +153,16 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         eraserCursor.frame = CGRect(origin: .zero, size: pageSize)
         eraserCursor.strokeColor = UIColor.systemGray.cgColor
         eraserCursor.fillColor = UIColor.systemGray.withAlphaComponent(0.15).cgColor
+
+        for layer in [resizeHandle, rotateHandle] {
+            layer.frame = CGRect(origin: .zero, size: pageSize)
+            layer.fillColor = UIColor.systemBlue.cgColor
+            layer.strokeColor = UIColor.white.cgColor
+            layer.lineWidth = 1
+        }
+        rotateHandleLine.frame = CGRect(origin: .zero, size: pageSize)
+        rotateHandleLine.strokeColor = UIColor.systemBlue.cgColor
+        rotateHandleLine.lineWidth = 1
 
         let menu = UIEditMenuInteraction(delegate: self)
         addInteraction(menu)
@@ -243,7 +265,18 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         case .lasso:
             activeTouch = touch
             let p = pagePoint(of: touch)
-            if !selection.isEmpty, selectionBounds.contains(p) {
+            if let handle = handleHit(p) {
+                switch handle {
+                case .resize:
+                    gesture = .resizing
+                    transformPivot = CGPoint(x: selectionBounds.minX, y: selectionBounds.minY) // opposite corner, fixed
+                case .rotate:
+                    gesture = .rotating
+                    transformPivot = CGPoint(x: selectionBounds.midX, y: selectionBounds.midY)
+                }
+                transformStartVector = CGPoint(x: p.x - transformPivot.x, y: p.y - transformPivot.y)
+                pendingTransform = .identity
+            } else if !selection.isEmpty, selectionBounds.contains(p) {
                 gesture = .moving
                 dragStart = p
                 dragOffset = .zero
@@ -276,6 +309,22 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
             let p = pagePoint(of: touch)
             dragOffset = CGSize(width: p.x - dragStart.x, height: p.y - dragStart.y)
             applyDrag()
+        case .resizing:
+            let p = pagePoint(of: touch)
+            let current = CGPoint(x: p.x - transformPivot.x, y: p.y - transformPivot.y)
+            let startLength = hypot(transformStartVector.x, transformStartVector.y)
+            guard startLength > 1 else { return }
+            let scale = max(0.2, min(6, hypot(current.x, current.y) / startLength))
+            applyPreviewTransform(CGAffineTransform(translationX: transformPivot.x, y: transformPivot.y)
+                .scaledBy(x: scale, y: scale)
+                .translatedBy(x: -transformPivot.x, y: -transformPivot.y))
+        case .rotating:
+            let p = pagePoint(of: touch)
+            let current = CGPoint(x: p.x - transformPivot.x, y: p.y - transformPivot.y)
+            let angle = atan2(current.y, current.x) - atan2(transformStartVector.y, transformStartVector.x)
+            applyPreviewTransform(CGAffineTransform(translationX: transformPivot.x, y: transformPivot.y)
+                .rotated(by: angle)
+                .translatedBy(x: -transformPivot.x, y: -transformPivot.y))
         }
     }
 
@@ -304,6 +353,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         case .erasing?: endErase()
         case .lassoing?: endLasso(commit: commit)
         case .moving?: endMove(commit: commit)
+        case .resizing?, .rotating?: endTransform(commit: commit)
         case nil: break
         }
     }
@@ -517,17 +567,43 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         let strokes = selectedStrokes
         withoutAnimation {
             guard var box = strokes.first?.bounds else {
-                selectionLayer.removeFromSuperlayer()
+                for layer in [selectionLayer, resizeHandle, rotateHandle, rotateHandleLine] { layer.removeFromSuperlayer() }
                 selectionBounds = .null
                 return
             }
             for stroke in strokes.dropFirst() { box = box.union(stroke.bounds) }
             selectionBounds = box.insetBy(dx: -8, dy: -8)
-            selectionLayer.transform = CATransform3DIdentity
+            for layer in [selectionLayer, resizeHandle, rotateHandle, rotateHandleLine] {
+                layer.transform = CATransform3DIdentity
+                layer.removeFromSuperlayer()
+            }
             selectionLayer.path = CGPath(roundedRect: selectionBounds, cornerWidth: 4, cornerHeight: 4, transform: nil)
-            selectionLayer.removeFromSuperlayer()
             host.layer.addSublayer(selectionLayer)
+
+            let r = handleReach / 2 / screenPerPagePoint
+            resizeHandle.path = CGPath(ellipseIn: CGRect(x: selectionBounds.maxX - r, y: selectionBounds.maxY - r, width: 2 * r, height: 2 * r), transform: nil)
+            host.layer.addSublayer(resizeHandle)
+
+            let rotateCenter = CGPoint(x: selectionBounds.midX, y: selectionBounds.minY - rotateHandleOffset / screenPerPagePoint)
+            let line = CGMutablePath()
+            line.move(to: CGPoint(x: selectionBounds.midX, y: selectionBounds.minY))
+            line.addLine(to: rotateCenter)
+            rotateHandleLine.path = line
+            host.layer.addSublayer(rotateHandleLine)
+            rotateHandle.path = CGPath(ellipseIn: CGRect(x: rotateCenter.x - r, y: rotateCenter.y - r, width: 2 * r, height: 2 * r), transform: nil)
+            host.layer.addSublayer(rotateHandle)
         }
+    }
+
+    private enum SelectionHandle { case resize, rotate }
+
+    private func handleHit(_ p: CGPoint) -> SelectionHandle? {
+        guard !selection.isEmpty else { return nil }
+        let reach = handleReach / screenPerPagePoint
+        if hypot(p.x - selectionBounds.maxX, p.y - selectionBounds.maxY) <= reach { return .resize }
+        let rotateCenter = CGPoint(x: selectionBounds.midX, y: selectionBounds.minY - rotateHandleOffset / screenPerPagePoint)
+        if hypot(p.x - rotateCenter.x, p.y - rotateCenter.y) <= reach { return .rotate }
+        return nil
     }
 
     private func clearSelection() {
@@ -537,12 +613,21 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         menu?.dismissMenu()
     }
 
-    // While dragging, the selected layers are only shifted; the strokes are rewritten when the pen lifts.
+    // While dragging, the selected layers (and their handles) are only shifted; the strokes are rewritten when
+    // the pen lifts.
     private func applyDrag() {
-        let shift = CATransform3DMakeTranslation(dragOffset.width, dragOffset.height, 0)
+        applyLiveTransform(CATransform3DMakeTranslation(dragOffset.width, dragOffset.height, 0))
+    }
+
+    private func applyPreviewTransform(_ transform: CGAffineTransform) {
+        pendingTransform = transform
+        applyLiveTransform(CATransform3DMakeAffineTransform(transform))
+    }
+
+    private func applyLiveTransform(_ transform: CATransform3D) {
         withoutAnimation {
-            for id in selection { layers[id]?.group.transform = shift }
-            selectionLayer.transform = shift
+            for id in selection { layers[id]?.group.transform = transform }
+            for layer in [selectionLayer, resizeHandle, rotateHandle, rotateHandleLine] { layer.transform = transform }
         }
     }
 
@@ -558,6 +643,22 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         let old = selection
         store.replace(remove: old, insert: moved, on: page)
         selection = Set(moved.map(\.id))
+        updateSelectionVisual()
+        presentMenu()
+    }
+
+    private func endTransform(commit: Bool) {
+        let transform = pendingTransform
+        pendingTransform = .identity
+        guard commit, transform != .identity else {
+            applyPreviewTransform(.identity) // snap the preview back; nothing was written to the store
+            if commit { presentMenu() }
+            return
+        }
+        let transformed = selectedStrokes.map { $0.transformed(by: transform) }
+        let old = selection
+        store.replace(remove: old, insert: transformed, on: page)
+        selection = Set(transformed.map(\.id))
         updateSelectionVisual()
         presentMenu()
     }
@@ -578,9 +679,14 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
                              suggestedActions: [UIMenuElement]) -> UIMenu? {
         UIMenu(children: [
+            UIAction(title: "복사", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in self?.copySelection() },
             UIAction(title: "복제", image: UIImage(systemName: "plus.square.on.square")) { [weak self] _ in self?.duplicateSelection() },
             UIAction(title: "삭제", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in self?.deleteSelection() },
         ])
+    }
+
+    private func copySelection() {
+        InkClipboard.copy(selectedStrokes)
     }
 
     private func duplicateSelection() {
@@ -595,5 +701,15 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private func deleteSelection() {
         store.replace(remove: selection, insert: [], on: page)
         clearSelection()
+    }
+
+    // Pastes onto THIS page (may be a different page, or even a different document, from where the copy was
+    // made), centered wherever the caller says is currently visible. Triggered from the "+" menu, not the lasso
+    // menu, since there is nothing to lasso-select when pasting into empty space.
+    func pasteClipboard(at center: CGPoint) {
+        let pasted = InkClipboard.pasteStrokes(centeredAt: center)
+        guard !pasted.isEmpty else { return }
+        store.replace(remove: [], insert: pasted, on: page)
+        // Not auto-selected: paste can happen from any tool, and a selection outline only means anything in lasso mode.
     }
 }
