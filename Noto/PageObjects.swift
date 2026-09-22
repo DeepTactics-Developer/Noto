@@ -142,17 +142,30 @@ final class ObjectStore {
     }
 }
 
+// A view whose empty areas never claim a touch, so it can cover a region wider than its actual content
+// (a full page, here) without blocking pencil/finger input meant for whatever sits behind it. Default
+// UIView.hitTest claims any point inside its own bounds even with no interactive content there — this override
+// is what makes only the REAL children (an actual text box or image) receive touches; anywhere else falls
+// through to the next view behind it. Every plain container in this per-page overlay needs this, not just the
+// outermost one — an inner UIView with no override of its own would still swallow touches on its own account.
+class PassthroughView: UIView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hit = super.hitTest(point, with: event)
+        return hit === self ? nil : hit
+    }
+}
+
 // MARK: - Per-page container
 
 // Hosts the text/image objects for one page, above the ink layer (so ink can't be drawn directly under an
 // object, which matches how inserting something and then annotating over it is expected to work). Uses the
 // same scale-transform-on-a-UIView trick as InkPageView's `host`, so objects scale with the page and ride
 // UIKit's rotation animation.
-final class ObjectsPageView: UIView {
+final class ObjectsPageView: PassthroughView {
     private let page: Int
     private let pageSize: CGSize
     private let store: ObjectStore
-    private let host = UIView()
+    private let host = PassthroughView()
     private var textViews: [UUID: TextBoxView] = [:]
     private var imageViews: [UUID: ImageBoxView] = [:]
     private var scale: CGFloat = 0
@@ -179,15 +192,6 @@ final class ObjectsPageView: UIView {
         scale = newScale
         let apply = { self.host.transform = CGAffineTransform(scaleX: newScale, y: newScale) }
         if first { UIView.performWithoutAnimation(apply) } else { apply() } // later changes animate with a rotation
-    }
-
-    // This view covers the whole page so its children can sit anywhere on it, but that would otherwise also
-    // make it claim every touch on empty parts of the page — including pencil touches meant for ink underneath,
-    // and finger touches meant for the scroll view. Only let an actual text/image child claim a touch; an empty
-    // area falls through to whatever is behind this view.
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        let hit = super.hitTest(point, with: event)
-        return hit === self ? nil : hit
     }
 
     // Brings the views in line with the store: adds missing objects, drops deleted ones, refreshes edits.
