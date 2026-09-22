@@ -12,6 +12,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     private let pages: [CGPDFPage]
     private let pageSizes: [CGSize] // displayed size in PDF points
     private let store: InkStore
+    private let model: NoteViewModel
 
     private let scrollView = UIScrollView()
     private let contentView = UIView()
@@ -33,11 +34,12 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     // The controller is the picker's responder, so the palette stays up while pages come and go.
     override var canBecomeFirstResponder: Bool { true }
 
-    init(folder: DocumentFolder, document: PDFDocument, pages: [CGPDFPage]) {
+    init(folder: DocumentFolder, document: PDFDocument, pages: [CGPDFPage], model: NoteViewModel) {
         self.folder = folder
         self.document = document
         self.pages = pages
         self.store = InkStore(folder: folder)
+        self.model = model
         self.pageSizes = pages.map { page in
             let box = page.getBoxRect(.cropBox)
             let rotated = page.rotationAngle % 180 != 0
@@ -76,6 +78,19 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         toolPicker.setVisible(true, forFirstResponder: self)
         NotificationCenter.default.addObserver(self, selector: #selector(flush), name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: UserDefaults.didChangeNotification, object: nil)
+        model.scrollToPage = { [weak self] index in self?.scrollToPage(index) }
+    }
+
+    // Called by the thumbnail sidebar. `frames` is always in the unscaled (zoomScale 1) coordinate space that
+    // scrollRectToVisible expects, regardless of the current zoom.
+    private func scrollToPage(_ index: Int) {
+        guard frames.indices.contains(index) else { return }
+        scrollView.scrollRectToVisible(frames[index], animated: true)
+    }
+
+    private func updateCurrentPage() {
+        guard let anchor = anchorAtTop(), model.currentPage != anchor.index else { return }
+        model.currentPage = anchor.index
     }
 
     // The eraser mode setting decides how the palette's eraser behaves, so the tool is mapped again.
@@ -121,6 +136,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
             scrollView.contentOffset = clamped(CGPoint(x: 0, y: frame.minY + anchor.fraction * frame.height))
         }
         layoutVisiblePages()
+        updateCurrentPage()
     }
 
     // Only called at zoom 1.
@@ -203,10 +219,12 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         layoutVisiblePages()
+        updateCurrentPage()
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
         layoutVisiblePages()
+        updateCurrentPage()
     }
 
     // The container was only scaled while pinching, so PDF tiles are soft; redraw them for the new zoom.
@@ -276,9 +294,10 @@ struct PDFNoteView: UIViewControllerRepresentable {
     let folder: DocumentFolder
     let document: PDFDocument
     let pages: [CGPDFPage]
+    let model: NoteViewModel
 
     func makeUIViewController(context: Context) -> PDFNoteViewController {
-        PDFNoteViewController(folder: folder, document: document, pages: pages)
+        PDFNoteViewController(folder: folder, document: document, pages: pages, model: model)
     }
 
     func updateUIViewController(_ controller: PDFNoteViewController, context: Context) {}

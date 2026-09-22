@@ -22,9 +22,9 @@ enum PDFRenderer {
         ctx.restoreGState()
     }
 
-    // Low-resolution stand-in shown while sharp tiles are still being drawn.
-    static func preview(of page: CGPDFPage, pageSize: CGSize) -> UIImage {
-        let width: CGFloat = 1000
+    // Low-resolution stand-in shown while sharp tiles are still being drawn, and the small thumbnails
+    // used in the library and the page rail (a narrower `width` there).
+    static func preview(of page: CGPDFPage, pageSize: CGSize, width: CGFloat = 1000) -> UIImage {
         let size = CGSize(width: width, height: (width * pageSize.height / pageSize.width).rounded())
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
