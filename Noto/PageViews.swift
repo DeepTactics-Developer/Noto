@@ -89,17 +89,20 @@ final class PageView: UIView {
     let ink: InkPageView
     let objects: ObjectsPageView
     private let pdfPage: CGPDFPage
+    private let pageSize: CGSize
     private let preview = UIImageView()
     private var tile: PDFTileView
     private var backTile: PDFTileView? // the previous tiles, kept underneath while the new ones draw
     private var resizePicture: UIView? // stand-in for the tiles while the page changes size
     private var screenScale: CGFloat = 0
     private var renderZoom: CGFloat = 1
+    private var didSetInitialContentScale = false
 
     private var tileScale: CGFloat { min(screenScale * renderZoom, 8) }
 
     init(page: CGPDFPage, pageSize: CGSize, index: Int, store: InkStore, objectStore: ObjectStore) {
         pdfPage = page
+        self.pageSize = pageSize
         tile = PDFTileView(page: page)
         ink = InkPageView(page: index, pageSize: pageSize, store: store)
         objects = ObjectsPageView(page: index, pageSize: pageSize, store: objectStore)
@@ -179,5 +182,15 @@ final class PageView: UIView {
         tile.frame = bounds
         ink.frame = bounds
         objects.frame = bounds
+
+        // Both scaled from here, in the same statement, so their host transforms animate in the same
+        // CATransaction during a rotation — see InkPageView.applyScale for why that matters.
+        let newScale = bounds.width / pageSize.width
+        if newScale > 0 {
+            let animated = didSetInitialContentScale
+            didSetInitialContentScale = true
+            ink.applyScale(newScale, animated: animated)
+            objects.applyScale(newScale, animated: animated)
+        }
     }
 }

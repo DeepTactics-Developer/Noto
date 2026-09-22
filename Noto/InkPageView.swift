@@ -203,14 +203,18 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        let newScale = bounds.width / pageSize.width
+    // Called by PageView.layoutSubviews, in the same statement as ObjectsPageView's own applyScale — each view
+    // used to compute this independently from its own layoutSubviews, which let the two host transforms start
+    // their implicit rotation animations a runloop tick apart. That's what made ink and the text/image objects
+    // visibly drift out of step for a few frames during a device rotation (confirmed by a frame-by-frame look
+    // at a screen recording of a rotation: an object's handle bar was visibly at a different angle than the
+    // surrounding ink for a couple of frames, back in sync a couple of frames later). Driving both from one
+    // caller in the same CATransaction keeps them locked together throughout.
+    func applyScale(_ newScale: CGFloat, animated: Bool) {
         guard newScale > 0, newScale != scale else { return }
-        let first = scale == 0
         scale = newScale
         let apply = { self.host.transform = CGAffineTransform(scaleX: newScale, y: newScale) }
-        if first { UIView.performWithoutAnimation(apply) } else { apply() } // later changes animate with a rotation
+        if animated { apply() } else { UIView.performWithoutAnimation(apply) }
     }
 
     private func withoutAnimation(_ body: () -> Void) {

@@ -200,14 +200,13 @@ final class ObjectsPageView: PassthroughView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        let newScale = bounds.width / pageSize.width
+    // See the matching method on InkPageView for why this is driven from PageView rather than computed here
+    // independently: it keeps this view's and ink's rotation-animation in the same CATransaction.
+    func applyScale(_ newScale: CGFloat, animated: Bool) {
         guard newScale > 0, newScale != scale else { return }
-        let first = scale == 0
         scale = newScale
         let apply = { self.host.transform = CGAffineTransform(scaleX: newScale, y: newScale) }
-        if first { UIView.performWithoutAnimation(apply) } else { apply() } // later changes animate with a rotation
+        if animated { apply() } else { UIView.performWithoutAnimation(apply) }
     }
 
     // Brings the views in line with the store: adds missing objects, drops deleted ones, refreshes edits.
