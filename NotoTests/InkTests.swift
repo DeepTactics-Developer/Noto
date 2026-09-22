@@ -125,6 +125,27 @@ final class InkTests: XCTestCase {
         XCTAssertEqual(rotated.width, 3)
     }
 
+    // This exact composition once produced a resize/rotate that visibly drifted away from its pivot instead of
+    // acting in place — the failure mode of getting CGAffineTransform builder order backwards.
+    func testPivotedTransformLeavesThePivotFixed() {
+        let pivot = CGPoint(x: 100, y: 60)
+        let scaled = CGAffineTransform.pivoted(CGAffineTransform(scaleX: 2, y: 2), around: pivot)
+        XCTAssertEqual(pivot.applying(scaled).x, pivot.x, accuracy: 0.0001)
+        XCTAssertEqual(pivot.applying(scaled).y, pivot.y, accuracy: 0.0001)
+
+        let rotated = CGAffineTransform.pivoted(CGAffineTransform(rotationAngle: .pi / 3), around: pivot)
+        XCTAssertEqual(pivot.applying(rotated).x, pivot.x, accuracy: 0.0001)
+        XCTAssertEqual(pivot.applying(rotated).y, pivot.y, accuracy: 0.0001)
+    }
+
+    func testPivotedScaleDoublesDistanceFromPivot() {
+        let pivot = CGPoint(x: 50, y: 50)
+        let scaled = CGAffineTransform.pivoted(CGAffineTransform(scaleX: 2, y: 2), around: pivot)
+        let point = CGPoint(x: 70, y: 50) // 20 to the right of the pivot
+        XCTAssertEqual(point.applying(scaled).x, 90, accuracy: 0.0001) // 40 to the right, not drifted elsewhere
+        XCTAssertEqual(point.applying(scaled).y, 50, accuracy: 0.0001)
+    }
+
     func testClipboardPasteRecentersAroundTheGivenPointWithFreshIDs() {
         let original = stroke([(0, 0), (10, 10)])
         InkClipboard.copy([original])

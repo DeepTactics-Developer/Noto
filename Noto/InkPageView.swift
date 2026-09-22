@@ -315,16 +315,12 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
             let startLength = hypot(transformStartVector.x, transformStartVector.y)
             guard startLength > 1 else { return }
             let scale = max(0.2, min(6, hypot(current.x, current.y) / startLength))
-            applyPreviewTransform(CGAffineTransform(translationX: transformPivot.x, y: transformPivot.y)
-                .scaledBy(x: scale, y: scale)
-                .translatedBy(x: -transformPivot.x, y: -transformPivot.y))
+            applyPreviewTransform(CGAffineTransform.pivoted(CGAffineTransform(scaleX: scale, y: scale), around: transformPivot))
         case .rotating:
             let p = pagePoint(of: touch)
             let current = CGPoint(x: p.x - transformPivot.x, y: p.y - transformPivot.y)
             let angle = atan2(current.y, current.x) - atan2(transformStartVector.y, transformStartVector.x)
-            applyPreviewTransform(CGAffineTransform(translationX: transformPivot.x, y: transformPivot.y)
-                .rotated(by: angle)
-                .translatedBy(x: -transformPivot.x, y: -transformPivot.y))
+            applyPreviewTransform(CGAffineTransform.pivoted(CGAffineTransform(rotationAngle: angle), around: transformPivot))
         }
     }
 

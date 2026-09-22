@@ -116,6 +116,20 @@ struct InkRun {
     var width: CGFloat
 }
 
+extension CGAffineTransform {
+    // `core` (a plain scale or rotation, defined about the origin) applied as if it were centered on `pivot`
+    // instead: move the pivot to the origin, apply `core`, move back. Built with `concatenating` specifically —
+    // its point-order ("self happens, then the argument happens") is the one unambiguous part of
+    // CGAffineTransform's composition rules; the `.scaledBy`/`.rotated(by:)`/`.translatedBy` builder chain reads
+    // the opposite way round from how it looks, and building a pivot transform with it produced strokes that
+    // drifted away from the pivot instead of turning in place.
+    static func pivoted(_ core: CGAffineTransform, around pivot: CGPoint) -> CGAffineTransform {
+        CGAffineTransform(translationX: -pivot.x, y: -pivot.y)
+            .concatenating(core)
+            .concatenating(CGAffineTransform(translationX: pivot.x, y: pivot.y))
+    }
+}
+
 enum InkGeometry {
     // Smooth curve through the samples: quadratic segments between midpoints, the samples being the controls.
     static func path(_ points: [InkPoint]) -> CGPath {
