@@ -3,7 +3,6 @@ import SwiftUI
 enum EraserMode: String, CaseIterable, Identifiable {
     case partial // only the touched part of a stroke goes
     case stroke // the whole stroke goes
-    case palette // follow the eraser type chosen in the tool palette
 
     var id: String { rawValue }
 
@@ -11,7 +10,6 @@ enum EraserMode: String, CaseIterable, Identifiable {
         switch self {
         case .partial: "부분 지우개"
         case .stroke: "획 지우개"
-        case .palette: "팔레트 설정 따르기"
         }
     }
 }
@@ -85,7 +83,7 @@ struct SettingsView: View {
                 } header: {
                     Text("지우개")
                 } footer: {
-                    Text("부분 지우개는 지우개가 닿은 부분만, 획 지우개는 닿은 획 전체를 지웁니다. 지우개를 대고 있는 동안 범위가 원으로 표시됩니다. 팔레트에서 고정 폭 지우개를 고르면 팔레트의 크기를 따릅니다.")
+                    Text("부분 지우개는 지우개가 닿은 부분만, 획 지우개는 닿은 획 전체를 지웁니다. 지우개를 대고 있는 동안 범위가 원으로 표시됩니다.")
                 }
             }
             .navigationTitle("설정")

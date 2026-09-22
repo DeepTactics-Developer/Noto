@@ -1,13 +1,13 @@
 import UIKit
 import PDFKit
-import PencilKit
 import PhotosUI
 import SwiftUI
 
 // Own page viewer: a vertical stack of pages inside a UIScrollView with its standard pinch zoom.
 // Layout never changes while zooming. Ink is vector and scales with the container; when a pinch ends the PDF
-// tiles are redrawn at the new resolution. PencilKit is only used for its tool palette.
-final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToolPickerObserver, PHPickerViewControllerDelegate {
+// tiles are redrawn at the new resolution. The pen/highlighter/eraser/lasso palette is our own SwiftUI toolbar
+// (NoteScreen's toolbar), driven into `mode` via model.toolState — no PencilKit UI involved.
+final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPickerViewControllerDelegate {
     private let folder: DocumentFolder
     private let document: PDFDocument // keeps the CGPDFPages alive
     private let pages: [CGPDFPage]
@@ -19,7 +19,6 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
 
     private let scrollView = UIScrollView()
     private let contentView = UIView()
-    private let toolPicker = PKToolPicker()
 
     private var frames: [CGRect] = []
     private var live: [Int: PageView] = [:]
@@ -28,13 +27,12 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     private let margin: CGFloat = 12 // page gap and side margin
 
     private var mode: InkMode = .none
-    private var currentTool: PKTool = PKInkingTool(.pen)
     private var saveAlertShown = false
 
     private let previews = NSCache<NSNumber, UIImage>()
     private let previewQueue = DispatchQueue(label: "noto.preview", qos: .userInitiated)
 
-    // The controller is the picker's responder, so the palette stays up while pages come and go.
+    // Registers ink/object edits on this responder's UndoManager so the toolbar's own undo/redo buttons find them.
     override var canBecomeFirstResponder: Bool { true }
 
     init(folder: DocumentFolder, document: PDFDocument, pages: [CGPDFPage], model: NoteViewModel) {
@@ -80,9 +78,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         scrollView.addSubview(contentView)
         view.addSubview(scrollView)
 
-        apply(toolPicker.selectedTool)
-        toolPicker.addObserver(self)
-        toolPicker.setVisible(true, forFirstResponder: self)
+        applyToolState()
         NotificationCenter.default.addObserver(self, selector: #selector(flush), name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: UserDefaults.didChangeNotification, object: nil)
         model.scrollToPage = { [weak self] index in self?.scrollToPage(index) }
@@ -90,6 +86,9 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         model.insertText = { [weak self] in self?.insertText() }
         model.insertImage = { [weak self] in self?.presentImagePicker() }
         model.pasteInk = { [weak self] in self?.pasteInk() }
+        model.toolStateDidChange = { [weak self] in self?.applyToolState() }
+        model.undo = { [weak self] in self?.undoManager?.undo() }
+        model.redo = { [weak self] in self?.undoManager?.redo() }
     }
 
     // MARK: Search
@@ -199,9 +198,9 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         return 0
     }
 
-    // The eraser mode setting decides how the palette's eraser behaves, so the tool is mapped again.
+    // The eraser mode/size settings affect how the current tool behaves, so it's re-derived when they change.
     @objc private func settingsChanged() {
-        apply(currentTool)
+        applyToolState()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -212,7 +211,6 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         flush()
-        toolPicker.setVisible(false, forFirstResponder: self)
         resignFirstResponder()
     }
 
@@ -351,32 +349,22 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         present(alert, animated: true)
     }
 
-    // MARK: Tools (PencilKit's palette is only the UI; the engine draws)
+    // MARK: Tools (the custom top toolbar is only the UI; the engine draws)
 
-    // Widths from the palette are in PencilKit's units, scaled here to page points. Tune by feel.
-    private func apply(_ tool: PKTool) {
-        currentTool = tool
-        switch tool {
-        case let ink as PKInkingTool:
-            var color = Self.rgba(ink.color)
-            if ink.inkType == .marker {
-                color[3] *= 0.35
-                mode = .draw(kind: .highlighter, color: color, width: max(Float(ink.width) * 0.75, 1))
-            } else {
-                mode = .draw(kind: .pen, color: color, width: max(Float(ink.width) * 0.5, 0.5))
-            }
-        case let eraser as PKEraserTool:
-            var radius = CGFloat(AppSettings.eraserSize)
-            if eraser.eraserType == .fixedWidthBitmap { radius = min(max(eraser.width / 2, 4), 60) } // the palette's own size
-            switch AppSettings.eraserMode {
-            case .partial: mode = .erase(partial: true, radius: radius)
-            case .stroke: mode = .erase(partial: false, radius: radius)
-            case .palette: mode = .erase(partial: eraser.eraserType != .vector, radius: radius)
-            }
-        case is PKLassoTool:
+    private func applyToolState() {
+        let state = model.toolState
+        switch state.tool {
+        case .pen:
+            mode = .draw(kind: .pen, color: Self.rgba(UIColor(state.penColor)), width: Float(state.penWidth))
+        case .highlighter:
+            var color = Self.rgba(UIColor(state.highlighterColor))
+            color[3] *= 0.35
+            mode = .draw(kind: .highlighter, color: color, width: Float(state.highlighterWidth))
+        case .eraser:
+            let radius = CGFloat(AppSettings.eraserSize)
+            mode = .erase(partial: AppSettings.eraserMode == .partial, radius: radius)
+        case .lasso:
             mode = .lasso
-        default:
-            mode = .none // the ruler is not built yet
         }
         live.values.forEach { $0.ink.mode = mode }
     }
@@ -386,15 +374,6 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
         color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .light)).getRed(&r, green: &g, blue: &b, alpha: &a)
         return [Float(r), Float(g), Float(b), Float(a)]
-    }
-
-    func toolPickerSelectedToolDidChange(_ toolPicker: PKToolPicker) {
-        apply(toolPicker.selectedTool)
-    }
-
-    @available(iOS 18.0, *)
-    func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
-        apply(toolPicker.selectedTool)
     }
 }
 

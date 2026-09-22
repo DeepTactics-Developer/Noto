@@ -1,10 +1,40 @@
 import SwiftUI
 import PDFKit
 
+enum DrawTool: String, CaseIterable, Identifiable {
+    case pen, highlighter, eraser, lasso
+    var id: String { rawValue }
+    var icon: String {
+        switch self {
+        case .pen: "pencil"
+        case .highlighter: "highlighter"
+        case .eraser: "eraser"
+        case .lasso: "lasso"
+        }
+    }
+}
+
+// The toolbar's own state, replacing PencilKit's system palette. A plain Equatable value so SwiftUI's
+// `.onChange` fires once per real change, however many of its fields moved.
+struct ToolState: Equatable {
+    var tool: DrawTool = .pen
+    var penColor = Color.black
+    var penWidth: Double = 3 // page points, before pressure
+    var highlighterColor = Color.yellow
+    var highlighterWidth: Double = 10
+
+    static let penColors: [Color] = [.black, .blue, .red, .green, .purple, .orange]
+    static let highlighterColors: [Color] = [.yellow, .green, .pink, .blue, .orange]
+}
+
 // Shared between the SwiftUI top bar/sidebar and the UIKit page viewer inside PDFNoteView.
 final class NoteViewModel: ObservableObject {
     @Published var currentPage = 0
     @Published var sidebarVisible = true
+    @Published var toolState = ToolState()
+    var toolStateDidChange: (() -> Void)?
+    var undo: (() -> Void)?
+    var redo: (() -> Void)?
     var scrollToPage: ((Int) -> Void)?
     var showMatch: ((Int, CGRect) -> Void)? // page index, rect in that page's own point space (top-left origin)
     var insertText: (() -> Void)?
@@ -35,52 +65,70 @@ struct NoteScreen: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Button(action: onClose) { Image(systemName: "chevron.left") }
                     .accessibilityLabel("라이브러리로")
                 if showingSearch {
                     searchBar
                 } else {
-                    Text(folder.title).font(.headline).lineLimit(1)
-                    Spacer()
-                    Text(AppInfo.version).font(.caption).foregroundStyle(.secondary)
+                    Text(folder.title).font(.subheadline.weight(.medium)).lineLimit(1).frame(maxWidth: 90, alignment: .leading)
                     if pdf != nil {
-                        Button { showingSearch = true } label: { Image(systemName: "magnifyingglass") }
-                            .accessibilityLabel("검색")
+                        Divider().frame(height: 20)
+                        toolGroup
+                        Divider().frame(height: 20)
+                        ToolbarIconButton(systemName: "arrow.uturn.backward") { model.undo?() }
+                            .accessibilityLabel("실행 취소")
+                        ToolbarIconButton(systemName: "arrow.uturn.forward") { model.redo?() }
+                            .accessibilityLabel("다시 실행")
                         Menu {
                             Button { model.insertText?() } label: { Label("텍스트 추가", systemImage: "textformat") }
                             Button { model.insertImage?() } label: { Label("이미지 추가", systemImage: "photo") }
                             Button { model.pasteInk?() } label: { Label("필기 붙여넣기", systemImage: "doc.on.clipboard") }
                         } label: {
-                            Image(systemName: "plus.circle")
+                            Image(systemName: "plus.circle").font(.system(size: 16)).frame(width: 30, height: 30)
                         }
                         .accessibilityLabel("추가")
-                        Button(action: toggleBookmark) {
-                            Image(systemName: bookmarks.contains(model.currentPage) ? "bookmark.fill" : "bookmark")
-                        }
-                        .accessibilityLabel("이 페이지 북마크")
                     }
-                    Button { model.sidebarVisible.toggle() } label: { Image(systemName: "sidebar.left") }
+                    Spacer(minLength: 4)
+                    if pdf != nil {
+                        ToolbarIconButton(systemName: "magnifyingglass") { showingSearch = true }
+                            .accessibilityLabel("검색")
+                        // Recording and AI aren't built yet — shown so the layout already has their place, greyed out.
+                        ToolbarIconButton(systemName: "mic", disabled: true) {}
+                            .accessibilityLabel("음성 녹음, 준비 중")
+                        ToolbarIconButton(systemName: "sparkles", disabled: true) {}
+                            .accessibilityLabel("AI, 준비 중")
+                        Divider().frame(height: 20)
+                        ToolbarIconButton(systemName: bookmarks.contains(model.currentPage) ? "bookmark.fill" : "bookmark", action: toggleBookmark)
+                            .accessibilityLabel("이 페이지 북마크")
+                    }
+                    ToolbarIconButton(systemName: "sidebar.left") { model.sidebarVisible.toggle() }
                         .accessibilityLabel("사이드바")
-                    Button { showingSettings = true } label: { Image(systemName: "gearshape") }
+                    ToolbarIconButton(systemName: "gearshape") { showingSettings = true }
                         .accessibilityLabel("설정")
                 }
             }
-            .padding(.horizontal)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
             .background(.bar)
 
             Divider()
 
             if let pdf {
-                HStack(spacing: 0) {
-                    if model.sidebarVisible {
-                        DocumentSidebar(folder: folder, pdf: pdf, pageCount: pages.count, bookmarks: $bookmarks, model: model)
-                            .frame(width: 150)
-                            .background(.bar)
-                        Divider()
+                ZStack(alignment: .top) {
+                    HStack(spacing: 0) {
+                        if model.sidebarVisible {
+                            DocumentSidebar(folder: folder, pdf: pdf, pageCount: pages.count, bookmarks: $bookmarks, model: model)
+                                .frame(width: 150)
+                                .background(.bar)
+                            Divider()
+                        }
+                        PDFNoteView(folder: folder, document: pdf, pages: pages, model: model)
                     }
-                    PDFNoteView(folder: folder, document: pdf, pages: pages, model: model)
+                    if model.toolState.tool == .pen || model.toolState.tool == .highlighter {
+                        ToolOptionsPill(toolState: $model.toolState)
+                            .padding(.top, 10)
+                    }
                 }
             } else if let errorText {
                 Spacer()
@@ -94,6 +142,17 @@ struct NoteScreen: View {
         }
         .sheet(isPresented: $showingSettings) { SettingsView() }
         .onAppear(perform: load)
+        .onChange(of: model.toolState) { _, _ in model.toolStateDidChange?() }
+    }
+
+    private var toolGroup: some View {
+        HStack(spacing: 2) {
+            ForEach(DrawTool.allCases) { tool in
+                ToolbarIconButton(systemName: tool.icon, selected: model.toolState.tool == tool) {
+                    model.toolState.tool = tool
+                }
+            }
+        }
     }
 
     private func load() {
@@ -167,6 +226,60 @@ struct NoteScreen: View {
         let next = ((matchIndex ?? 0) + delta + matches.count) % matches.count
         matchIndex = next
         model.showMatch?(matches[next].page, matches[next].rect)
+    }
+}
+
+// MARK: - Toolbar
+
+private struct ToolbarIconButton: View {
+    let systemName: String
+    var selected: Bool = false
+    var disabled: Bool = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 16))
+                .frame(width: 30, height: 30)
+                .background(selected ? Color.accentColor.opacity(0.15) : .clear)
+                .foregroundStyle(selected ? Color.accentColor : (disabled ? Color.secondary.opacity(0.4) : Color.primary))
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .disabled(disabled)
+        .buttonStyle(.plain)
+    }
+}
+
+// Floats above the page when the pen or highlighter is selected: color swatches, a custom color well, and a
+// width slider. Which fields it edits depends on which of the two tools is currently active.
+private struct ToolOptionsPill: View {
+    @Binding var toolState: ToolState
+
+    private var isHighlighter: Bool { toolState.tool == .highlighter }
+    private var widthRange: ClosedRange<Double> { isHighlighter ? 4...24 : 1...10 }
+    private var currentColor: Binding<Color> { isHighlighter ? $toolState.highlighterColor : $toolState.penColor }
+    private var currentWidth: Binding<Double> { isHighlighter ? $toolState.highlighterWidth : $toolState.penWidth }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ForEach(isHighlighter ? ToolState.highlighterColors : ToolState.penColors, id: \.self) { color in
+                Circle()
+                    .fill(color)
+                    .frame(width: 20, height: 20)
+                    .overlay(Circle().stroke(.primary, lineWidth: currentColor.wrappedValue == color ? 2 : 0).padding(-2))
+                    .onTapGesture { currentColor.wrappedValue = color }
+            }
+            ColorPicker("사용자 지정 색상", selection: currentColor).labelsHidden().frame(width: 20, height: 20)
+            Divider().frame(height: 20)
+            Slider(value: currentWidth, in: widthRange, step: 1).frame(width: 90)
+            Text("\(Int(currentWidth.wrappedValue))").font(.caption).monospacedDigit().foregroundStyle(.secondary).frame(width: 16)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(.separator, lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
     }
 }
 
