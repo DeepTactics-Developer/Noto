@@ -153,7 +153,9 @@ enum ShapeRecognizer {
 
     private static func distance(from p: CGPoint, toPolygon corners: [CGPoint]) -> CGFloat {
         var best = CGFloat.greatestFiniteMagnitude
-        for i in 0..<corners.count { best = min(best, distance(from: p, to: corners[i], corners[(i + 1) % corners.count])) }
+        for i in 0..<corners.count {
+            best = min(best, InkGeometry.distance(from: p, to: corners[i], corners[(i + 1) % corners.count]))
+        }
         return best
     }
 
