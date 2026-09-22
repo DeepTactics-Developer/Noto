@@ -16,6 +16,8 @@ struct DocumentFolder: Identifiable, Hashable {
     var id: String { url.lastPathComponent }
     var pdfURL: URL { url.appending(path: "source.pdf") }
     func inkURL(page: Int) -> URL { url.appending(path: "p\(page).ink") }
+    func objectsURL(page: Int) -> URL { url.appending(path: "p\(page).objects") }
+    func fileURL(_ name: String) -> URL { url.appending(path: name) } // inserted images
 }
 
 struct NotAPDF: LocalizedError {

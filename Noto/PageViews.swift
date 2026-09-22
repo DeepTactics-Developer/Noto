@@ -87,6 +87,7 @@ final class PDFTileView: UIView {
 // One page, bottom to top: low-res preview, sharp PDF tiles, ink.
 final class PageView: UIView {
     let ink: InkPageView
+    let objects: ObjectsPageView
     private let pdfPage: CGPDFPage
     private let preview = UIImageView()
     private var tile: PDFTileView
@@ -97,16 +98,18 @@ final class PageView: UIView {
 
     private var tileScale: CGFloat { min(screenScale * renderZoom, 8) }
 
-    init(page: CGPDFPage, pageSize: CGSize, index: Int, store: InkStore) {
+    init(page: CGPDFPage, pageSize: CGSize, index: Int, store: InkStore, objectStore: ObjectStore) {
         pdfPage = page
         tile = PDFTileView(page: page)
         ink = InkPageView(page: index, pageSize: pageSize, store: store)
+        objects = ObjectsPageView(page: index, pageSize: pageSize, store: objectStore)
         super.init(frame: .zero)
         backgroundColor = .white
         preview.contentMode = .scaleToFill
         addSubview(preview)
         addSubview(tile)
         addSubview(ink)
+        addSubview(objects) // above ink, so a pencil touch can't draw directly under a text box/image
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -175,5 +178,6 @@ final class PageView: UIView {
         backTile?.frame = bounds
         tile.frame = bounds
         ink.frame = bounds
+        objects.frame = bounds
     }
 }

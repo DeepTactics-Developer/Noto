@@ -1,18 +1,21 @@
 import UIKit
 import PDFKit
 import PencilKit
+import PhotosUI
 import SwiftUI
 
 // Own page viewer: a vertical stack of pages inside a UIScrollView with its standard pinch zoom.
 // Layout never changes while zooming. Ink is vector and scales with the container; when a pinch ends the PDF
 // tiles are redrawn at the new resolution. PencilKit is only used for its tool palette.
-final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToolPickerObserver {
+final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToolPickerObserver, PHPickerViewControllerDelegate {
     private let folder: DocumentFolder
     private let document: PDFDocument // keeps the CGPDFPages alive
     private let pages: [CGPDFPage]
     private let pageSizes: [CGSize] // displayed size in PDF points
     private let store: InkStore
+    private let objectStore: ObjectStore
     private let model: NoteViewModel
+    private var imagePickerPage: Int?
 
     private let scrollView = UIScrollView()
     private let contentView = UIView()
@@ -39,6 +42,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         self.document = document
         self.pages = pages
         self.store = InkStore(folder: folder)
+        self.objectStore = ObjectStore(folder: folder)
         self.model = model
         self.pageSizes = pages.map { page in
             let box = page.getBoxRect(.cropBox)
@@ -51,6 +55,9 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         store.undoManager = { [weak self] in self?.undoManager }
         store.onChange = { [weak self] page in self?.live[page]?.ink.sync() }
         store.onSaveError = { [weak self] error in self?.reportSaveFailure(error) }
+        objectStore.undoManager = { [weak self] in self?.undoManager }
+        objectStore.onChange = { [weak self] page in self?.live[page]?.objects.sync() }
+        objectStore.onSaveError = { [weak self] error in self?.reportSaveFailure(error) }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -79,6 +86,74 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         NotificationCenter.default.addObserver(self, selector: #selector(flush), name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: UserDefaults.didChangeNotification, object: nil)
         model.scrollToPage = { [weak self] index in self?.scrollToPage(index) }
+        model.showMatch = { [weak self] page, rect in self?.flashHighlight(page: page, rectInPage: rect) }
+        model.insertText = { [weak self] in self?.insertText() }
+        model.insertImage = { [weak self] in self?.presentImagePicker() }
+    }
+
+    // MARK: Search
+
+    // Jumps to the match's page and briefly flashes its rect. The rect comes from PDFKit's own text layout in
+    // that page's point space, which already accounts for rotation the same way pageSizes does.
+    private func flashHighlight(page: Int, rectInPage: CGRect) {
+        guard frames.indices.contains(page) else { return }
+        scrollToPage(page)
+        let pageFrame = frames[page]
+        let scale = pageFrame.width / pageSizes[page].width
+        let highlightFrame = CGRect(x: pageFrame.minX + rectInPage.minX * scale, y: pageFrame.minY + rectInPage.minY * scale,
+                                    width: rectInPage.width * scale, height: rectInPage.height * scale).insetBy(dx: -2, dy: -2)
+        let box = UIView(frame: highlightFrame)
+        box.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.4)
+        box.layer.cornerRadius = 2
+        contentView.addSubview(box)
+        UIView.animate(withDuration: 1.0, delay: 0.7, options: []) { box.alpha = 0 } completion: { _ in box.removeFromSuperview() }
+    }
+
+    // MARK: Insert text / image
+
+    // A point near the middle of whatever part of the page is currently on screen, so a freshly inserted
+    // object doesn't land off-screen on a page taller than the viewport.
+    private func visibleCenter(on page: Int) -> CGPoint {
+        let visible = visibleRect().intersection(frames[page])
+        let localY = visible.isNull ? pageSizes[page].height / 2 : visible.midY - frames[page].minY
+        return CGPoint(x: pageSizes[page].width / 2, y: max(20, min(localY, pageSizes[page].height - 20)))
+    }
+
+    private func insertText() {
+        let page = model.currentPage
+        live[page]?.objects.insertText(at: visibleCenter(on: page))
+    }
+
+    private func presentImagePicker() {
+        imagePickerPage = model.currentPage
+        var config = PHPickerConfiguration()
+        config.filter = .images
+        config.selectionLimit = 1
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = self
+        present(picker, animated: true)
+    }
+
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        guard let page = imagePickerPage, let provider = results.first?.itemProvider,
+              provider.canLoadObject(ofClass: UIImage.self) else { return }
+        provider.loadObject(ofClass: UIImage.self) { [weak self] object, _ in
+            guard let image = object as? UIImage else { return }
+            DispatchQueue.main.async { self?.addPickedImage(image, on: page) }
+        }
+    }
+
+    private func addPickedImage(_ image: UIImage, on page: Int) {
+        guard let data = image.jpegData(compressionQuality: 0.85) else { return }
+        let filename = "image_\(UUID().uuidString).jpg"
+        do {
+            try data.write(to: folder.fileURL(filename))
+        } catch {
+            reportSaveFailure(error)
+            return
+        }
+        live[page]?.objects.insertImage(image, filename: filename, at: visibleCenter(on: page))
     }
 
     // Called by the thumbnail sidebar. scrollRectToVisible only guarantees the rect becomes visible with the
@@ -95,9 +170,27 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         scrollView.setContentOffset(target, animated: true)
     }
 
+    // "Current page" for the sidebar highlight: whichever page covers the middle of the viewport, not just
+    // whichever page's top edge the viewport has scrolled past. A page shorter than the viewport can leave its
+    // last sliver at the very top while the next page already fills most of the screen; topmost-edge anchoring
+    // (used above for rotation continuity, where exactness matters more than perception) would keep reporting
+    // the page that's mostly scrolled away.
     private func updateCurrentPage() {
-        guard let anchor = anchorAtTop(), model.currentPage != anchor.index else { return }
-        model.currentPage = anchor.index
+        guard let index = pageAtViewportCenter(), model.currentPage != index else { return }
+        model.currentPage = index
+    }
+
+    private func pageAtViewportCenter() -> Int? {
+        let center = visibleRect().midY
+        if let hit = frames.firstIndex(where: { $0.minY <= center && center <= $0.maxY }) { return hit }
+        // In the gap between pages: whichever page's edge is closer.
+        return frames.indices.min { gapTo(frames[$0], center) < gapTo(frames[$1], center) }
+    }
+
+    private func gapTo(_ frame: CGRect, _ y: CGFloat) -> CGFloat {
+        if y < frame.minY { return frame.minY - y }
+        if y > frame.maxY { return y - frame.maxY }
+        return 0
     }
 
     // The eraser mode setting decides how the palette's eraser behaves, so the tool is mapped again.
@@ -119,6 +212,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
 
     @objc private func flush() {
         store.flush()
+        objectStore.flush()
     }
 
     // MARK: Layout
@@ -189,7 +283,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
     }
 
     private func show(_ index: Int) {
-        let view = PageView(page: pages[index], pageSize: pageSizes[index], index: index, store: store)
+        let view = PageView(page: pages[index], pageSize: pageSizes[index], index: index, store: store, objectStore: objectStore)
         view.frame = frames[index]
         view.ink.mode = mode
         view.setRenderZoom(renderZoom)

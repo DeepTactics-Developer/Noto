@@ -6,6 +6,15 @@ final class NoteViewModel: ObservableObject {
     @Published var currentPage = 0
     @Published var sidebarVisible = true
     var scrollToPage: ((Int) -> Void)?
+    var showMatch: ((Int, CGRect) -> Void)? // page index, rect in that page's own point space (top-left origin)
+    var insertText: (() -> Void)?
+    var insertImage: (() -> Void)?
+}
+
+struct SearchMatch: Identifiable {
+    let id = UUID()
+    let page: Int
+    let rect: CGRect
 }
 
 struct NoteScreen: View {
@@ -17,6 +26,10 @@ struct NoteScreen: View {
     @State private var bookmarks: Set<Int> = []
     @State private var errorText: String?
     @State private var showingSettings = false
+    @State private var showingSearch = false
+    @State private var searchQuery = ""
+    @State private var matches: [SearchMatch] = []
+    @State private var matchIndex: Int?
     @StateObject private var model = NoteViewModel()
 
     var body: some View {
@@ -24,19 +37,32 @@ struct NoteScreen: View {
             HStack(spacing: 12) {
                 Button(action: onClose) { Image(systemName: "chevron.left") }
                     .accessibilityLabel("라이브러리로")
-                Text(folder.title).font(.headline).lineLimit(1)
-                Spacer()
-                Text(AppInfo.version).font(.caption).foregroundStyle(.secondary)
-                if pdf != nil {
-                    Button(action: toggleBookmark) {
-                        Image(systemName: bookmarks.contains(model.currentPage) ? "bookmark.fill" : "bookmark")
+                if showingSearch {
+                    searchBar
+                } else {
+                    Text(folder.title).font(.headline).lineLimit(1)
+                    Spacer()
+                    Text(AppInfo.version).font(.caption).foregroundStyle(.secondary)
+                    if pdf != nil {
+                        Button { showingSearch = true } label: { Image(systemName: "magnifyingglass") }
+                            .accessibilityLabel("검색")
+                        Menu {
+                            Button { model.insertText?() } label: { Label("텍스트 추가", systemImage: "textformat") }
+                            Button { model.insertImage?() } label: { Label("이미지 추가", systemImage: "photo") }
+                        } label: {
+                            Image(systemName: "plus.circle")
+                        }
+                        .accessibilityLabel("추가")
+                        Button(action: toggleBookmark) {
+                            Image(systemName: bookmarks.contains(model.currentPage) ? "bookmark.fill" : "bookmark")
+                        }
+                        .accessibilityLabel("이 페이지 북마크")
                     }
-                    .accessibilityLabel("이 페이지 북마크")
+                    Button { model.sidebarVisible.toggle() } label: { Image(systemName: "sidebar.left") }
+                        .accessibilityLabel("사이드바")
+                    Button { showingSettings = true } label: { Image(systemName: "gearshape") }
+                        .accessibilityLabel("설정")
                 }
-                Button { model.sidebarVisible.toggle() } label: { Image(systemName: "sidebar.left") }
-                    .accessibilityLabel("사이드바")
-                Button { showingSettings = true } label: { Image(systemName: "gearshape") }
-                    .accessibilityLabel("설정")
             }
             .padding(.horizontal)
             .padding(.vertical, 8)
@@ -81,6 +107,61 @@ struct NoteScreen: View {
     private func toggleBookmark() {
         Library.toggleBookmark(model.currentPage, for: folder)
         bookmarks = Library.bookmarkedPages(for: folder)
+    }
+
+    // MARK: Search
+
+    private var searchBar: some View {
+        HStack(spacing: 10) {
+            TextField("PDF에서 검색", text: $searchQuery)
+                .textFieldStyle(.roundedBorder)
+                .submitLabel(.search)
+                .onSubmit(runSearch)
+            if !matches.isEmpty {
+                Text("\((matchIndex ?? 0) + 1)/\(matches.count)").font(.caption).foregroundStyle(.secondary)
+                Button { step(-1) } label: { Image(systemName: "chevron.up") }
+                Button { step(1) } label: { Image(systemName: "chevron.down") }
+            } else if !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+                Text("결과 없음").font(.caption).foregroundStyle(.secondary)
+            }
+            Button {
+                showingSearch = false
+                searchQuery = ""
+                matches = []
+                matchIndex = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private func runSearch() {
+        guard let pdf else { return }
+        let query = searchQuery.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else {
+            matches = []
+            matchIndex = nil
+            return
+        }
+        matches = pdf.findString(query, withOptions: [.caseInsensitive]).compactMap { selection -> SearchMatch? in
+            guard let page = selection.pages.first else { return nil }
+            let natural = page.bounds(for: .cropBox).size // PDFKit already accounts for the page's own rotation here
+            guard natural.height > 0 else { return nil }
+            let bottomLeft = selection.bounds(for: page) // origin bottom-left, PDF's own convention
+            let topLeft = CGRect(x: bottomLeft.minX, y: natural.height - bottomLeft.maxY, width: bottomLeft.width, height: bottomLeft.height)
+            return SearchMatch(page: pdf.index(for: page), rect: topLeft)
+        }
+        .sorted { $0.page < $1.page }
+        matchIndex = matches.isEmpty ? nil : 0
+        if let first = matches.first { model.showMatch?(first.page, first.rect) }
+    }
+
+    private func step(_ delta: Int) {
+        guard !matches.isEmpty else { return }
+        let next = ((matchIndex ?? 0) + delta + matches.count) % matches.count
+        matchIndex = next
+        model.showMatch?(matches[next].page, matches[next].rect)
     }
 }
 
