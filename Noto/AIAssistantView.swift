@@ -11,11 +11,17 @@ private struct AIMessage: Identifiable {
 struct AIAssistantView: View {
     let document: PDFDocument
     let onJumpToPage: (Int) -> Void
+    // Set when opened from the lasso's "AI로 설명" instead of the toolbar AI icon: the gathered PDF text +
+    // recognized handwriting from inside the selection, explained automatically as soon as the sheet appears.
+    var selectionToExplain: String? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var index: DocumentTextIndex?
     @State private var question = ""
     @State private var messages: [AIMessage] = []
     @State private var loading = false
+    @State private var explainedSelection = false
+    @StateObject private var dictation = VoiceDictation()
+    @State private var dictationError: String?
     private let availability = AIAvailability.current
 
     var body: some View {
@@ -36,7 +42,13 @@ struct AIAssistantView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("닫기") { dismiss() } } }
         }
-        .onAppear { if index == nil { index = DocumentTextIndex(document: document) } }
+        .onAppear {
+            if index == nil { index = DocumentTextIndex(document: document) }
+            if let selectionToExplain, !explainedSelection {
+                explainedSelection = true
+                Task { await explainSelection(selectionToExplain) }
+            }
+        }
     }
 
     private var chatBody: some View {
@@ -74,17 +86,30 @@ struct AIAssistantView: View {
             .padding(.horizontal, 12)
             .padding(.top, 8)
             HStack(spacing: 10) {
-                TextField("문서에 대해 질문하기", text: $question)
+                TextField(dictation.isListening ? "듣고 있어요…" : "문서에 대해 질문하기", text: $question)
                     .textFieldStyle(.roundedBorder)
                     .submitLabel(.send)
                     .onSubmit { Task { await ask() } }
                     .disabled(loading)
+                Button {
+                    dictation.isListening ? dictation.stop() : dictation.start()
+                } label: {
+                    Image(systemName: dictation.isListening ? "mic.fill" : "mic")
+                        .font(.title3)
+                        .foregroundStyle(dictation.isListening ? Color.red : Color.accentColor)
+                }
+                .disabled(loading)
                 Button { Task { await ask() } } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
                     .disabled(loading || question.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             .padding(12)
         }
         .background(Color(.systemGroupedBackground))
+        .onChange(of: dictation.partialText) { _, text in question = text }
+        .onAppear { dictation.onError = { dictationError = $0.localizedDescription } }
+        .alert("음성 입력을 사용할 수 없습니다", isPresented: .constant(dictationError != nil), presenting: dictationError) { _ in
+            Button("확인") { dictationError = nil }
+        } message: { Text($0) }
     }
 
     // The user's own question: a right-aligned bubble, like an outgoing message.
@@ -132,6 +157,27 @@ struct AIAssistantView: View {
                 }
             }
         }
+    }
+
+    private func explainSelection(_ content: String) async {
+        guard !content.trimmingCharacters(in: .whitespaces).isEmpty else {
+            messages.append(AIMessage(question: "선택한 내용 설명", answer: "선택 영역에서 텍스트나 필기를 인식하지 못했습니다.", isError: true))
+            return
+        }
+        loading = true
+        defer { loading = false }
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *) {
+            do {
+                let answer = try await AIAssistant.explainSelection(content)
+                messages.append(AIMessage(question: "선택한 내용 설명", answer: answer))
+            } catch {
+                messages.append(AIMessage(question: "선택한 내용 설명", answer: "설명하지 못했습니다: \(error.localizedDescription)", isError: true))
+            }
+            return
+        }
+        #endif
+        messages.append(AIMessage(question: "선택한 내용 설명", answer: "이 빌드에서는 AI 기능을 사용할 수 없습니다.", isError: true))
     }
 
     private func ask() async {

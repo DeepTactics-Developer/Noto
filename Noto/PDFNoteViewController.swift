@@ -98,9 +98,10 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         model.redo = { [weak self] in self?.undoManager?.redo() }
         model.toggleRecording = { [weak self] in self?.toggleRecording() }
         model.searchHandwriting = { [weak self] query in await self?.searchHandwriting(query) ?? [] }
-        recorder.onFinish = { [weak self] filename, duration in
+        model.recordingPlaybackTick = { [weak self] id, seconds in self?.highlightPlayback(recordingID: id, at: seconds) }
+        recorder.onFinish = { [weak self] id, filename, duration in
             guard let self else { return }
-            RecordingStore.add(filename: filename, pageIndex: model.currentPage, duration: duration, for: folder)
+            RecordingStore.add(id: id, filename: filename, pageIndex: model.currentPage, duration: duration, for: folder)
             model.isRecording = false
         }
         recorder.onError = { [weak self] error in
@@ -118,6 +119,34 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
             model.isRecording = true
             recorder.start(in: folder)
         }
+    }
+
+    // MARK: Playback ↔ ink sync
+
+    private var highlightedRecordingID: UUID?
+    private var highlightedStrokeIDs: Set<UUID> = []
+
+    // Called a few times a second while a recording plays (see RecordingPlayer.onTick): flashes whatever ink
+    // was drawn around this point in the recording, following it to a different page if needed — the reverse
+    // of Notability's audio-follows-your-tap, this is ink-follows-the-audio.
+    private func highlightPlayback(recordingID: UUID, at seconds: TimeInterval) {
+        if recordingID != highlightedRecordingID {
+            highlightedRecordingID = recordingID
+            highlightedStrokeIDs = []
+        }
+        let window: Float = 0.6 // seconds either side of the playhead still counts as "being written now"
+        var matched: [(page: Int, stroke: InkStroke)] = []
+        for page in pages.indices {
+            for stroke in store.strokes(on: page) where stroke.recordingID == recordingID {
+                guard let offset = stroke.recordingOffset, abs(offset - Float(seconds)) <= window,
+                      !highlightedStrokeIDs.contains(stroke.id) else { continue }
+                matched.append((page, stroke))
+            }
+        }
+        guard !matched.isEmpty else { return }
+        highlightedStrokeIDs.formUnion(matched.map { $0.stroke.id })
+        if let firstPage = matched.map(\.page).min(), model.currentPage != firstPage { scrollToPage(firstPage) }
+        for (page, stroke) in matched { flashHighlight(page: page, rectInPage: stroke.bounds) }
     }
 
     // MARK: Handwriting search
@@ -139,6 +168,40 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
             }
         }
         return results
+    }
+
+    // MARK: AI explain-selection
+
+    // Gathers whatever the lasso covers — PDF text whose characters fall inside the loop, plus recognized
+    // handwriting from the selected strokes — and hands it to the AI sheet. Runs on a Task since Vision OCR is
+    // async; the lasso's own selection menu already dismissed by the time this starts, so there's no UI to block.
+    private func explainSelection(_ strokes: [InkStroke], _ polygon: [CGPoint], on pageIndex: Int) {
+        Task {
+            async let ocr = HandwritingSearch.recognize(strokes: strokes, pageSize: pageSizes[pageIndex])
+            let selectedText = pdfText(inside: polygon, on: pageIndex)
+            let handwritingText = await ocr.map(\.text).joined(separator: " ")
+            let combined = [selectedText, handwritingText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+            model.explainSelection?(combined)
+        }
+    }
+
+    // Every PDF character whose center falls inside the lasso polygon, in reading order — the same precision
+    // the lasso already gives ink (a real loop, not just its bounding box).
+    private func pdfText(inside polygon: [CGPoint], on pageIndex: Int) -> String {
+        guard let pdfPage = document.page(at: pageIndex), let fullString = pdfPage.string as NSString? else { return "" }
+        let count = min(pdfPage.numberOfCharacters, fullString.length)
+        guard count > 0 else { return "" }
+        let naturalHeight = pageSizes[pageIndex].height
+        guard naturalHeight > 0 else { return "" }
+        var result = ""
+        for i in 0..<count {
+            let bounds = pdfPage.characterBounds(at: i) // bottom-left origin
+            let center = CGPoint(x: bounds.midX, y: naturalHeight - bounds.midY) // flip to this app's top-left space
+            if InkGeometry.pointInPolygon(center, polygon) {
+                result += fullString.substring(with: NSRange(location: i, length: 1))
+            }
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: Search
@@ -267,7 +330,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
     private func drawInk(on page: Int, in ctx: CGContext) {
         for stroke in store.strokes(on: page) {
             let color = InkStroke.uiColor(stroke.color).cgColor
-            for run in InkGeometry.runs(of: stroke.points, width: stroke.width, pressure: stroke.pressure) {
+            for run in InkGeometry.runs(of: stroke.points, width: stroke.width, pressure: stroke.pressure, kind: stroke.kind) {
                 ctx.setStrokeColor(color)
                 ctx.setLineWidth(run.width)
                 ctx.setLineCap(.round)
@@ -470,6 +533,8 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         view.ink.mode = mode
         view.ink.textLineProvider = { [weak self] in self?.textLines(on: index) ?? [] }
         view.ink.onCanvasTouch = { [weak view] in view?.objects.deselectAll() }
+        view.ink.onExplainSelection = { [weak self] strokes, polygon in self?.explainSelection(strokes, polygon, on: index) }
+        view.ink.activeRecording = { [weak self] in self?.recorder.elapsed.map { (id: $0.id, elapsed: $0.seconds) } }
         view.setRenderZoom(renderZoom)
         contentView.addSubview(view)
         contentView.sendSubviewToBack(view) // pages never overlap each other, but this keeps overlays (search highlight) on top
@@ -535,7 +600,9 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         let state = model.toolState
         switch state.tool {
         case .pen:
-            mode = .draw(kind: .pen, color: Self.rgba(UIColor(state.penColor)), width: Float(state.penWidth))
+            var color = Self.rgba(UIColor(state.penColor))
+            if state.penKind == .pencil { color[3] *= 0.82 } // a touch of translucency reads as graphite, not ink
+            mode = .draw(kind: state.penKind.inkKind, color: color, width: Float(state.penWidth))
         case .highlighter:
             var color = Self.rgba(UIColor(state.highlighterColor))
             color[3] *= 0.35

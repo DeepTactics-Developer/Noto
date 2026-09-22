@@ -76,6 +76,17 @@ enum AIAssistant {
         return response.content
     }
 
+    // For the lasso selection's own "AI로 설명" — explains exactly the given content (PDF text + recognized
+    // handwriting from inside the lasso), not a document-wide search like `answer`.
+    static func explainSelection(_ content: String) async throws -> String {
+        let session = LanguageModelSession(instructions: """
+            사용자가 문서에서 선택한 내용이야. 한국어로 간결하게 설명해줘. 선택 내용이 수식이나 개념이면 풀어서,
+            문장이면 요점을, 목록이면 각 항목의 의미를 설명해.
+            """)
+        let response = try await session.respond(to: content)
+        return response.content
+    }
+
     // Walks pages in order, taking as much of each as fits a fixed character budget — keeps the whole document
     // representable without blowing past the on-device model's context window, at the cost of skipping the tail
     // of a very long document (mentioned to the model so it can say so in the summary).

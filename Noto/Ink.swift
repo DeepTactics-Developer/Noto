@@ -1,7 +1,7 @@
 import UIKit
 
 enum InkKind: Int, Codable {
-    case pen, highlighter
+    case pen, highlighter, pencil, fountainPen, marker
 }
 
 // One sampled pen position, in page coordinates (PDF points, origin at the page's top-left).
@@ -22,8 +22,13 @@ struct InkStroke: Identifiable, Codable {
     let pressure: Float // 0 = constant width; otherwise how strongly pen force changes the width
     let points: [InkPoint]
     let bounds: CGRect // derived from the points, not stored
+    // Set only when this stroke was drawn while a voice recording was running: which recording, and how many
+    // seconds into it. Playback uses this to highlight strokes as their moment comes up (see PDFNoteViewController).
+    let recordingID: UUID?
+    let recordingOffset: Float?
 
-    init(id: UUID = UUID(), kind: InkKind, color: [Float], width: Float, pressure: Float = 0, points: [InkPoint]) {
+    init(id: UUID = UUID(), kind: InkKind, color: [Float], width: Float, pressure: Float = 0, points: [InkPoint],
+         recordingID: UUID? = nil, recordingOffset: Float? = nil) {
         self.id = id
         self.kind = kind
         self.color = color
@@ -31,6 +36,8 @@ struct InkStroke: Identifiable, Codable {
         self.pressure = pressure
         self.points = points
         self.bounds = InkStroke.bounds(of: points)
+        self.recordingID = recordingID
+        self.recordingOffset = recordingOffset
     }
 
     static func uiColor(_ rgba: [Float]) -> UIColor {
@@ -46,7 +53,7 @@ struct InkStroke: Identifiable, Codable {
             p.x += Float(offset.width)
             p.y += Float(offset.height)
             return p
-        })
+        }, recordingID: recordingID, recordingOffset: recordingOffset)
     }
 
     // The same stroke scaled and/or rotated (lasso resize/rotate handles). Width scales with the transform's
@@ -59,7 +66,7 @@ struct InkStroke: Identifiable, Codable {
             p.x = Float(moved.x)
             p.y = Float(moved.y)
             return p
-        })
+        }, recordingID: recordingID, recordingOffset: recordingOffset)
     }
 
     private static func bounds(of points: [InkPoint]) -> CGRect {
@@ -73,7 +80,7 @@ struct InkStroke: Identifiable, Codable {
     }
 
     // Points are stored flat (x, y, force, time) to keep the file small.
-    private enum CodingKeys: String, CodingKey { case id, kind, color, width, pressure, pts }
+    private enum CodingKeys: String, CodingKey { case id, kind, color, width, pressure, pts, recordingID, recordingOffset }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -90,7 +97,9 @@ struct InkStroke: Identifiable, Codable {
                   color: color,
                   width: try container.decode(Float.self, forKey: .width),
                   pressure: try container.decodeIfPresent(Float.self, forKey: .pressure) ?? 0, // files from before pressure
-                  points: points)
+                  points: points,
+                  recordingID: try container.decodeIfPresent(UUID.self, forKey: .recordingID), // files from before audio sync
+                  recordingOffset: try container.decodeIfPresent(Float.self, forKey: .recordingOffset))
     }
 
     func encode(to encoder: Encoder) throws {
@@ -101,6 +110,8 @@ struct InkStroke: Identifiable, Codable {
         try container.encode(width, forKey: .width)
         try container.encode(pressure, forKey: .pressure)
         try container.encode(points.flatMap { [$0.x, $0.y, $0.force, $0.time] }, forKey: .pts)
+        try container.encodeIfPresent(recordingID, forKey: .recordingID)
+        try container.encodeIfPresent(recordingOffset, forKey: .recordingOffset)
     }
 }
 
@@ -160,18 +171,34 @@ enum InkGeometry {
         return max(0.25, 1 + CGFloat(pressure) * 2 * (firm - 0.4))
     }
 
-    // Splits a stroke into runs of one width each. Force is averaged over five samples and the width only steps
-    // when it has really moved, so pen jitter does not chop the stroke into many runs. Neighbouring runs share a point.
-    static func runs(of points: [InkPoint], width: Float, pressure: Float) -> [InkRun] {
-        guard pressure > 0, points.count > 2 else { return [InkRun(points: points, width: CGFloat(width))] }
-        let step = max(CGFloat(width) * 0.1, 0.05)
+    // Splits a stroke into runs of one width each. `kind` picks the width curve: fountain pen varies with the
+    // stroke's local direction (a fixed nib angle, independent of pressure); everything else varies with force
+    // the same way it always has. Force is averaged over five samples and the width only steps when it has
+    // really moved, so pen jitter does not chop the stroke into many runs. Neighbouring runs share a point.
+    static func runs(of points: [InkPoint], width: Float, pressure: Float, kind: InkKind) -> [InkRun] {
+        guard points.count > 2 else { return [InkRun(points: points, width: CGFloat(width))] }
+        if kind == .fountainPen {
+            let nibAngle: CGFloat = .pi / 4 // classic 45° calligraphy nib
+            return quantizedRuns(points, width: width) { i in
+                let a = points[max(0, i - 1)].cg, b = points[min(points.count - 1, i + 1)].cg
+                let direction = atan2(b.y - a.y, b.x - a.x)
+                return max(0.22, abs(cos(direction - nibAngle)))
+            }
+        }
+        guard pressure > 0 else { return [InkRun(points: points, width: CGFloat(width))] }
         let smooth: [Float] = points.indices.map { i in
             let lo = max(0, i - 2), hi = min(points.count - 1, i + 2)
             return points[lo...hi].reduce(0) { $0 + $1.force } / Float(hi - lo + 1)
         }
-        func levels(_ i: Int) -> CGFloat {
-            widthFactor(force: smooth[i], pressure: pressure) * CGFloat(width) / step
-        }
+        return quantizedRuns(points, width: width) { i in widthFactor(force: smooth[i], pressure: pressure) }
+    }
+
+    // Shared by every width curve above: turns a per-point width-FACTOR stream into runs of one quantized width
+    // each, stepping only when the width has really moved. `factor` returns a multiplier on `width`, at whatever
+    // scale it likes — this function normalizes it into discrete steps itself.
+    private static func quantizedRuns(_ points: [InkPoint], width: Float, factor: (Int) -> CGFloat) -> [InkRun] {
+        let step = max(CGFloat(width) * 0.1, 0.05)
+        func levels(_ i: Int) -> CGFloat { factor(i) * CGFloat(width) / step }
         var runs: [InkRun] = []
         var current = [points[0]]
         var level = max(1, Int(levels(0).rounded()))
@@ -186,6 +213,23 @@ enum InkGeometry {
         }
         if current.count > 1 || runs.isEmpty { runs.append(InkRun(points: current, width: CGFloat(level) * step)) }
         return runs
+    }
+
+    // Standard ray-casting point-in-polygon test, used to test whether a PDF character's center falls inside a
+    // freehand lasso loop (for "AI, explain this selection" gathering PDF text under the same lasso ink uses).
+    static func pointInPolygon(_ point: CGPoint, _ polygon: [CGPoint]) -> Bool {
+        guard polygon.count >= 3 else { return false }
+        var inside = false
+        var j = polygon.count - 1
+        for i in 0..<polygon.count {
+            let pi = polygon[i], pj = polygon[j]
+            if (pi.y > point.y) != (pj.y > point.y),
+               point.x < (pj.x - pi.x) * (point.y - pi.y) / (pj.y - pi.y) + pi.x {
+                inside.toggle()
+            }
+            j = i
+        }
+        return inside
     }
 
     static func distance(from p: CGPoint, to a: CGPoint, _ b: CGPoint) -> CGFloat {
@@ -235,7 +279,8 @@ enum InkGeometry {
         flush()
         return pieces
             .filter { $0.count >= 2 && ShapeRecognizer.pathLength($0.map(\.cg)) >= 0.3 }
-            .map { InkStroke(kind: stroke.kind, color: stroke.color, width: stroke.width, pressure: stroke.pressure, points: $0) }
+            .map { InkStroke(kind: stroke.kind, color: stroke.color, width: stroke.width, pressure: stroke.pressure, points: $0,
+                             recordingID: stroke.recordingID, recordingOffset: stroke.recordingOffset) }
     }
 
     // The part of segment a-b (as parameters 0...1) that lies inside the circle, if any.

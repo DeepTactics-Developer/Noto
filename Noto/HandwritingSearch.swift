@@ -15,7 +15,7 @@ enum HandwritingSearch {
             ctx.cgContext.scaleBy(x: scale, y: scale)
             for stroke in strokes {
                 let color = InkStroke.uiColor(stroke.color).cgColor
-                for run in InkGeometry.runs(of: stroke.points, width: stroke.width, pressure: stroke.pressure) {
+                for run in InkGeometry.runs(of: stroke.points, width: stroke.width, pressure: stroke.pressure, kind: stroke.kind) {
                     ctx.cgContext.setStrokeColor(color)
                     ctx.cgContext.setLineWidth(run.width)
                     ctx.cgContext.setLineCap(.round)

@@ -7,13 +7,18 @@ struct Recording: Codable, Identifiable {
     var pageIndex: Int
     var duration: TimeInterval
     var createdAt: Date
+    // Filled in lazily, only once the user taps "텍스트 보기" — never computed eagerly, so the list stays quick
+    // to load and quiet until asked. Optional properties decode to nil automatically for older recordings.json
+    // files that predate this field, so no custom Codable needed.
+    var transcript: String?
 
-    init(id: UUID = UUID(), filename: String, pageIndex: Int, duration: TimeInterval, createdAt: Date = .now) {
+    init(id: UUID = UUID(), filename: String, pageIndex: Int, duration: TimeInterval, createdAt: Date = .now, transcript: String? = nil) {
         self.id = id
         self.filename = filename
         self.pageIndex = pageIndex
         self.duration = duration
         self.createdAt = createdAt
+        self.transcript = transcript
     }
 }
 
@@ -33,13 +38,22 @@ enum RecordingStore {
         try? data.write(to: url(for: folder), options: .atomic)
     }
 
+    // `id` matches the one VoiceRecorder minted when it started, so strokes tagged with it while recording
+    // (InkStroke.recordingID) line up with this Recording.
     @discardableResult
-    static func add(filename: String, pageIndex: Int, duration: TimeInterval, for folder: DocumentFolder) -> Recording {
+    static func add(id: UUID, filename: String, pageIndex: Int, duration: TimeInterval, for folder: DocumentFolder) -> Recording {
         var list = all(for: folder)
-        let recording = Recording(filename: filename, pageIndex: pageIndex, duration: duration)
+        let recording = Recording(id: id, filename: filename, pageIndex: pageIndex, duration: duration)
         list.append(recording)
         save(list, for: folder)
         return recording
+    }
+
+    static func setTranscript(_ transcript: String, for id: UUID, in folder: DocumentFolder) {
+        var list = all(for: folder)
+        guard let i = list.firstIndex(where: { $0.id == id }) else { return }
+        list[i].transcript = transcript
+        save(list, for: folder)
     }
 
     static func delete(_ id: UUID, for folder: DocumentFolder) {
@@ -61,10 +75,18 @@ final class VoiceRecorder: NSObject, AVAudioRecorderDelegate {
     private var recorder: AVAudioRecorder?
     private var startedAt: Date?
     private var filename: String?
-    var onFinish: ((String, TimeInterval) -> Void)?
+    // Minted at the start of recording (not at the end, like the rest of this class's state) so strokes drawn
+    // while it's running can be tagged with the SAME id the eventual Recording gets — see InkPageView.activeRecording.
+    private(set) var id: UUID?
+    var onFinish: ((UUID, String, TimeInterval) -> Void)?
     var onError: ((Error) -> Void)?
 
     var isRecording: Bool { recorder?.isRecording ?? false }
+    // (id, seconds elapsed) while recording, for tagging strokes as they're drawn.
+    var elapsed: (id: UUID, seconds: TimeInterval)? {
+        guard let id, let startedAt else { return nil }
+        return (id, Date.now.timeIntervalSince(startedAt))
+    }
 
     func start(in folder: DocumentFolder) {
         AVAudioApplication.requestRecordPermission { [weak self] granted in
@@ -96,20 +118,22 @@ final class VoiceRecorder: NSObject, AVAudioRecorderDelegate {
             recorder = newRecorder
             filename = name
             startedAt = .now
+            id = UUID()
         } catch {
             onError?(error)
         }
     }
 
     func stop() {
-        guard let recorder, let startedAt, let filename else { return }
+        guard let recorder, let startedAt, let filename, let id else { return }
         recorder.stop()
         try? AVAudioSession.sharedInstance().setActive(false)
         let duration = Date.now.timeIntervalSince(startedAt)
         self.recorder = nil
         self.startedAt = nil
         self.filename = nil
-        onFinish?(filename, duration)
+        self.id = nil
+        onFinish?(id, filename, duration)
     }
 
     func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
@@ -117,16 +141,18 @@ final class VoiceRecorder: NSObject, AVAudioRecorderDelegate {
     }
 }
 
-// Plays one recording at a time; `playingID` drives the play/stop icon in RecordingList.
+// Plays one recording at a time; `playingID` drives the play/stop icon in RecordingList. While playing, ticks
+// `onTick` a few times a second with (recording id, seconds into it) so the note view can highlight whatever
+// ink was drawn at that moment — the audio↔stroke sync.
 final class RecordingPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var playingID: UUID?
     private var player: AVAudioPlayer?
+    private var tickTimer: Timer?
+    var onTick: ((UUID, TimeInterval) -> Void)?
 
     func toggle(_ recording: Recording, folder: DocumentFolder) {
         if playingID == recording.id {
-            player?.stop()
-            player = nil
-            playingID = nil
+            stop()
             return
         }
         guard let newPlayer = try? AVAudioPlayer(contentsOf: folder.fileURL(recording.filename)) else { return }
@@ -134,9 +160,22 @@ final class RecordingPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         newPlayer.play()
         player = newPlayer
         playingID = recording.id
+        tickTimer?.invalidate()
+        tickTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+            guard let self, let player = self.player, let id = self.playingID else { return }
+            self.onTick?(id, player.currentTime)
+        }
+    }
+
+    private func stop() {
+        player?.stop()
+        player = nil
+        playingID = nil
+        tickTimer?.invalidate()
+        tickTimer = nil
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        DispatchQueue.main.async { self.playingID = nil }
+        DispatchQueue.main.async { self.stop() }
     }
 }

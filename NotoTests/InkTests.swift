@@ -80,17 +80,63 @@ final class InkTests: XCTestCase {
 
     func testNoPressureGivesOneRun() {
         let points = (0..<20).map { InkPoint(x: Float($0), y: 0, force: Float($0) / 20, time: 0) }
-        XCTAssertEqual(InkGeometry.runs(of: points, width: 4, pressure: 0).count, 1)
+        XCTAssertEqual(InkGeometry.runs(of: points, width: 4, pressure: 0, kind: .pen).count, 1)
     }
 
     func testRisingPressureGivesWideningRunsThatShareTheirJoints() {
         let points = (0..<60).map { InkPoint(x: Float($0) * 2, y: 0, force: 0.1 + Float($0) / 60 * 0.8, time: Float($0) * 0.01) }
-        let runs = InkGeometry.runs(of: points, width: 4, pressure: 0.8)
+        let runs = InkGeometry.runs(of: points, width: 4, pressure: 0.8, kind: .pen)
         XCTAssertGreaterThan(runs.count, 1)
         XCTAssertEqual(runs.map(\.width), runs.map(\.width).sorted()) // wider as the pen presses harder
         for (a, b) in zip(runs, runs.dropFirst()) { XCTAssertEqual(a.points.last, b.points.first) }
         XCTAssertEqual(runs.first?.points.first, points.first)
         XCTAssertEqual(runs.last?.points.last, points.last)
+    }
+
+    // A stroke along the nib angle (45°) should come out wider than one perpendicular to it (135°) — the
+    // calligraphy-pen effect fountain pen uses instead of pressure.
+    func testFountainPenIsWiderAlongTheNibAngle() {
+        let diagonal = (0..<30).map { i -> InkPoint in
+            let t = Float(i)
+            return InkPoint(x: t, y: t, force: 0.5, time: t * 0.01) // 45°, matches the nib
+        }
+        let across = (0..<30).map { i -> InkPoint in
+            let t = Float(i)
+            return InkPoint(x: t, y: -t, force: 0.5, time: t * 0.01) // 135°, perpendicular to the nib
+        }
+        let wideRuns = InkGeometry.runs(of: diagonal, width: 4, pressure: 0, kind: .fountainPen)
+        let thinRuns = InkGeometry.runs(of: across, width: 4, pressure: 0, kind: .fountainPen)
+        let maxWide = wideRuns.map(\.width).max() ?? 0
+        let maxThin = thinRuns.map(\.width).max() ?? 0
+        XCTAssertGreaterThan(maxWide, maxThin)
+    }
+
+    func testPointInPolygonInsideAndOutsideASquare() {
+        let square = [CGPoint(x: 0, y: 0), CGPoint(x: 10, y: 0), CGPoint(x: 10, y: 10), CGPoint(x: 0, y: 10)]
+        XCTAssertTrue(InkGeometry.pointInPolygon(CGPoint(x: 5, y: 5), square))
+        XCTAssertFalse(InkGeometry.pointInPolygon(CGPoint(x: 15, y: 5), square))
+    }
+
+    // A stroke drawn during a recording keeps that link through the same edits that already preserve
+    // pressure/color across a move or a resize.
+    func testRecordingTagSurvivesMoveAndTransform() {
+        let recordingID = UUID()
+        let tagged = InkStroke(kind: .pen, color: [0, 0, 0, 1], width: 2, points: [InkPoint(x: 0, y: 0, force: 0.5, time: 0)],
+                               recordingID: recordingID, recordingOffset: 12.5)
+        XCTAssertEqual(tagged.moved(by: CGSize(width: 5, height: 5)).recordingID, recordingID)
+        XCTAssertEqual(tagged.transformed(by: .init(scaleX: 2, y: 2)).recordingOffset, 12.5)
+    }
+
+    // Files written before audio↔stroke sync existed have neither key, same precedent as pressure above.
+    func testFileWithoutRecordingKeysStillOpens() throws {
+        let old: [String: Any] = [
+            "version": 1,
+            "strokes": [["id": UUID().uuidString, "kind": 0, "color": [0, 0, 0, 1], "width": 2, "pts": [1, 2, 0.5, 0, 3, 4, 0.5, 0.25]]],
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: old, format: .binary, options: 0)
+        let decoded = try PropertyListDecoder().decode(InkPageFile.self, from: data)
+        XCTAssertNil(decoded.strokes[0].recordingID)
+        XCTAssertNil(decoded.strokes[0].recordingOffset)
     }
 
     func testLassoPicksStrokesMostlyInsideTheLoop() {

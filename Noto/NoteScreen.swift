@@ -14,10 +14,42 @@ enum DrawTool: String, CaseIterable, Identifiable {
     }
 }
 
+// The "pen" toolbar slot is one of these four variants at a time — picked from a row in ToolOptionsPill rather
+// than each getting its own toolbar icon, so the busy top bar doesn't grow by three more buttons.
+enum PenKind: String, CaseIterable, Identifiable, Codable {
+    case pen, pencil, fountainPen, marker
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .pen: "펜"
+        case .pencil: "연필"
+        case .fountainPen: "만년필"
+        case .marker: "마커"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .pen: "pencil.tip"
+        case .pencil: "pencil"
+        case .fountainPen: "paintbrush.pointed"
+        case .marker: "paintbrush.fill"
+        }
+    }
+    var inkKind: InkKind {
+        switch self {
+        case .pen: .pen
+        case .pencil: .pencil
+        case .fountainPen: .fountainPen
+        case .marker: .marker
+        }
+    }
+}
+
 // The toolbar's own state, replacing PencilKit's system palette. A plain Equatable value so SwiftUI's
 // `.onChange` fires once per real change, however many of its fields moved.
 struct ToolState: Equatable {
     var tool: DrawTool = .pen
+    var penKind: PenKind = .pen
     var penColor = Color.black
     var penWidth: Double = 3 // page points, before pressure
     var highlighterColor = Color.yellow
@@ -44,6 +76,8 @@ final class NoteViewModel: ObservableObject {
     var exportPDF: (() -> Void)?
     var toggleRecording: (() -> Void)?
     var searchHandwriting: ((String) async -> [SearchMatch])?
+    var explainSelection: ((String) -> Void)?
+    var recordingPlaybackTick: ((UUID, TimeInterval) -> Void)?
 }
 
 struct SearchMatch: Identifiable {
@@ -82,6 +116,7 @@ struct NoteScreen: View {
     @State private var showingSettings = false
     @State private var showingFlashcards = false
     @State private var showingAI = false
+    @State private var explainSelectionText: String?
     @State private var showingSearch = false
     @State private var searchQuery = ""
     @State private var searchScope: SearchScope = .both
@@ -124,7 +159,7 @@ struct NoteScreen: View {
                             .accessibilityLabel("검색")
                         MicToolbarButton(isRecording: model.isRecording, onToggle: { model.toggleRecording?() },
                                          listContent: { RecordingList(folder: folder, model: model) })
-                        ToolbarIconButton(systemName: "sparkles") { showingAI = true }
+                        ToolbarIconButton(systemName: "sparkles") { explainSelectionText = nil; showingAI = true }
                             .accessibilityLabel("AI")
                         ToolbarIconButton(systemName: "rectangle.on.rectangle") { showingFlashcards = true }
                             .accessibilityLabel("플래시카드")
@@ -173,16 +208,27 @@ struct NoteScreen: View {
         .sheet(isPresented: $showingSettings) { SettingsView() }
         .sheet(isPresented: $showingFlashcards) { FlashcardsView(folder: folder) }
         .sheet(isPresented: $showingAI) {
-            if let pdf { AIAssistantView(document: pdf, onJumpToPage: { model.scrollToPage?($0) }) }
+            if let pdf {
+                AIAssistantView(document: pdf, onJumpToPage: { model.scrollToPage?($0) }, selectionToExplain: explainSelectionText)
+            }
         }
         .onAppear(perform: load)
+        .onAppear {
+            model.explainSelection = { text in
+                explainSelectionText = text
+                showingAI = true
+            }
+        }
         .onChange(of: model.toolState) { _, _ in model.toolStateDidChange?() }
     }
 
     private var toolGroup: some View {
         HStack(spacing: 2) {
             ForEach(DrawTool.allCases) { tool in
-                ToolbarIconButton(systemName: tool.icon, selected: model.toolState.tool == tool) {
+                // The pen slot's icon reflects whichever pen variant (pen/pencil/fountain pen/marker) is
+                // currently picked — see the row in ToolOptionsPill that switches it.
+                ToolbarIconButton(systemName: tool == .pen ? model.toolState.penKind.icon : tool.icon,
+                                  selected: model.toolState.tool == tool) {
                     model.toolState.tool = tool
                 }
             }
@@ -340,28 +386,49 @@ private struct ToolOptionsPill: View {
     @Binding var toolState: ToolState
 
     private var isHighlighter: Bool { toolState.tool == .highlighter }
-    private var widthRange: ClosedRange<Double> { isHighlighter ? 4...24 : 1...10 }
+    private var isMarker: Bool { toolState.tool == .pen && toolState.penKind == .marker }
+    private var widthRange: ClosedRange<Double> { (isHighlighter || isMarker) ? 4...24 : 1...10 }
     private var currentColor: Binding<Color> { isHighlighter ? $toolState.highlighterColor : $toolState.penColor }
     private var currentWidth: Binding<Double> { isHighlighter ? $toolState.highlighterWidth : $toolState.penWidth }
 
     var body: some View {
-        HStack(spacing: 10) {
-            ForEach(isHighlighter ? ToolState.highlighterColors : ToolState.penColors, id: \.self) { color in
-                Circle()
-                    .fill(color)
-                    .frame(width: 20, height: 20)
-                    .overlay(Circle().stroke(.primary, lineWidth: currentColor.wrappedValue == color ? 2 : 0).padding(-2))
-                    .onTapGesture { currentColor.wrappedValue = color }
+        VStack(spacing: 8) {
+            if toolState.tool == .pen {
+                HStack(spacing: 4) {
+                    ForEach(PenKind.allCases) { kind in
+                        Button { toolState.penKind = kind } label: {
+                            VStack(spacing: 2) {
+                                Image(systemName: kind.icon).font(.system(size: 14))
+                                Text(kind.label).font(.system(size: 9))
+                            }
+                            .frame(width: 46, height: 36)
+                            .background(toolState.penKind == kind ? Color.accentColor.opacity(0.15) : .clear)
+                            .foregroundStyle(toolState.penKind == kind ? Color.accentColor : Color.primary)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                Divider().frame(width: 200)
             }
-            ColorPicker("사용자 지정 색상", selection: currentColor).labelsHidden().frame(width: 20, height: 20)
-            Divider().frame(height: 20)
-            Slider(value: currentWidth, in: widthRange, step: 1).frame(width: 90)
-            Text("\(Int(currentWidth.wrappedValue))").font(.caption).monospacedDigit().foregroundStyle(.secondary).frame(width: 16)
+            HStack(spacing: 10) {
+                ForEach(isHighlighter ? ToolState.highlighterColors : ToolState.penColors, id: \.self) { color in
+                    Circle()
+                        .fill(color)
+                        .frame(width: 20, height: 20)
+                        .overlay(Circle().stroke(.primary, lineWidth: currentColor.wrappedValue == color ? 2 : 0).padding(-2))
+                        .onTapGesture { currentColor.wrappedValue = color }
+                }
+                ColorPicker("사용자 지정 색상", selection: currentColor).labelsHidden().frame(width: 20, height: 20)
+                Divider().frame(height: 20)
+                Slider(value: currentWidth, in: widthRange, step: 1).frame(width: 90)
+                Text("\(Int(currentWidth.wrappedValue))").font(.caption).monospacedDigit().foregroundStyle(.secondary).frame(width: 16)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().stroke(.separator, lineWidth: 0.5))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.separator, lineWidth: 0.5))
         .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
     }
 }
@@ -537,6 +604,9 @@ private struct RecordingList: View {
     @ObservedObject var model: NoteViewModel
     @StateObject private var player = RecordingPlayer()
     @State private var recordings: [Recording] = []
+    @State private var transcribingID: UUID?
+    @State private var transcribeError: String?
+    @State private var showingTranscript: Recording?
 
     var body: some View {
         ScrollView {
@@ -555,6 +625,13 @@ private struct RecordingList: View {
                                 Text(formatted(recording.duration)).font(.caption2).foregroundStyle(.secondary)
                             }
                             Spacer()
+                            if transcribingID == recording.id {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Button { Task { await showTranscript(recording) } } label: {
+                                    Image(systemName: recording.transcript == nil ? "text.bubble" : "text.bubble.fill")
+                                }
+                            }
                             Button { model.scrollToPage?(recording.pageIndex) } label: { Image(systemName: "arrow.right.circle") }
                             Button(role: .destructive) {
                                 RecordingStore.delete(recording.id, for: folder)
@@ -568,15 +645,57 @@ private struct RecordingList: View {
                 .padding(8)
             }
         }
-        .onAppear { recordings = RecordingStore.all(for: folder) }
+        .onAppear {
+            recordings = RecordingStore.all(for: folder)
+            player.onTick = { id, seconds in model.recordingPlaybackTick?(id, seconds) }
+        }
         .onChange(of: model.isRecording) { _, isRecording in
             if !isRecording { recordings = RecordingStore.all(for: folder) } // refresh right after a stop
+        }
+        .sheet(item: $showingTranscript) { recording in TranscriptView(recording: recording) }
+        .alert("텍스트로 바꾸지 못했습니다", isPresented: .constant(transcribeError != nil), presenting: transcribeError) { _ in
+            Button("확인") { transcribeError = nil }
+        } message: { Text($0) }
+    }
+
+    // Transcribed on demand, not eagerly — "텍스트 보기" is the only thing that ever triggers this, so the
+    // recording list itself never has to show the text (avoiding the clutter that was the whole point).
+    private func showTranscript(_ recording: Recording) async {
+        if recording.transcript != nil {
+            showingTranscript = recording
+            return
+        }
+        transcribingID = recording.id
+        defer { transcribingID = nil }
+        do {
+            let text = try await Transcriber.transcribe(fileURL: folder.fileURL(recording.filename))
+            RecordingStore.setTranscript(text, for: recording.id, in: folder)
+            recordings = RecordingStore.all(for: folder)
+            showingTranscript = recordings.first { $0.id == recording.id }
+        } catch {
+            transcribeError = error.localizedDescription
         }
     }
 
     private func formatted(_ duration: TimeInterval) -> String {
         let seconds = Int(duration.rounded())
         return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+}
+
+private struct TranscriptView: View {
+    let recording: Recording
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(recording.transcript ?? "").font(.body).frame(maxWidth: .infinity, alignment: .leading).padding(16)
+            }
+            .navigationTitle("녹음 텍스트")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("닫기") { dismiss() } } }
+        }
     }
 }
 

@@ -27,8 +27,8 @@ private final class StrokeLayers {
         group.frame = CGRect(origin: .zero, size: size)
     }
 
-    func update(points: [InkPoint], color: [Float], width: Float, pressure: Float) {
-        let runs = InkGeometry.runs(of: points, width: width, pressure: pressure)
+    func update(points: [InkPoint], color: [Float], width: Float, pressure: Float, kind: InkKind) {
+        let runs = InkGeometry.runs(of: points, width: width, pressure: pressure, kind: kind)
         while shapes.count < runs.count {
             let shape = NoActionShapeLayer()
             shape.frame = CGRect(origin: .zero, size: size)
@@ -46,9 +46,10 @@ private final class StrokeLayers {
         }
     }
 
-    // A single custom path at a fixed width (snapped shapes).
+    // A single custom path at a fixed width (snapped shapes) — the path is overwritten below regardless of
+    // how `update` would have run-split it, so `kind` here is arbitrary.
     func show(path: CGPath, color: [Float], width: Float) {
-        update(points: [InkPoint(x: 0, y: 0, force: 0, time: 0)], color: color, width: width, pressure: 0)
+        update(points: [InkPoint(x: 0, y: 0, force: 0, time: 0)], color: color, width: width, pressure: 0, kind: .pen)
         shapes[0].path = path
     }
 }
@@ -93,6 +94,10 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private var wetPoints: [InkPoint] = []
     private var wetStyle: (kind: InkKind, color: [Float], width: Float, pressure: Float)?
     private var wetStart: TimeInterval = 0
+    private var wetRecording: (id: UUID, offset: Float)?
+    // Queried when a stroke begins, so the finished stroke can be tagged with which recording (if any) was
+    // running and how far into it — playback uses this to highlight strokes as their moment comes up.
+    var activeRecording: (() -> (id: UUID, elapsed: TimeInterval)?)?
     private let minStep: CGFloat = 0.3 // page points; closer samples are dropped
 
     // hold to shape
@@ -109,6 +114,11 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     // and passes pencil through but claims fingers, only happens for a touch that landed on empty canvas (or a
     // pencil touch anywhere). The owner uses this to deselect any selected text/image object.
     var onCanvasTouch: (() -> Void)?
+    // Called when the user picks "AI로 설명" from the lasso selection menu, with the selected strokes and the
+    // lasso's own loop (page points) — the owner uses the loop to also gather any PDF text inside it, so the
+    // explanation isn't limited to handwriting.
+    var onExplainSelection: (([InkStroke], [CGPoint]) -> Void)?
+    private var lastLassoPolygon: [CGPoint] = []
     private let holdSlop: CGFloat = 3 // screen points the pen may wander and still count as held
 
     // erasing
@@ -226,7 +236,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
 
     private func makeLayers(for stroke: InkStroke) -> StrokeLayers {
         let strokeLayers = StrokeLayers(size: pageSize)
-        strokeLayers.update(points: stroke.points, color: stroke.color, width: stroke.width, pressure: stroke.pressure)
+        strokeLayers.update(points: stroke.points, color: stroke.color, width: stroke.width, pressure: stroke.pressure, kind: stroke.kind)
         return strokeLayers
     }
 
@@ -368,8 +378,9 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private func beginStroke(_ touch: UITouch, kind: InkKind, color: [Float], width: Float) {
         wetStart = touch.timestamp
         wetPoints = []
-        let pressure: Float = kind == .pen && AppSettings.pressure ? Float(AppSettings.pressureSensitivity) : 0
+        let pressure: Float = (kind == .pen || kind == .pencil) && AppSettings.pressure ? Float(AppSettings.pressureSensitivity) : 0
         wetStyle = (kind, color, width, pressure)
+        wetRecording = activeRecording?().map { (id: $0.id, offset: Float($0.elapsed)) }
         snapped = nil
         if AppSettings.shapeSnap {
             holdDelay = AppSettings.holdDelay
@@ -396,7 +407,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         guard let wet, let style = wetStyle else { return }
         var points = wetPoints
         if let touch, let predicted = event?.predictedTouches(for: touch) { points += predicted.map(sample) }
-        withoutAnimation { wet.update(points: points, color: style.color, width: style.width, pressure: style.pressure) }
+        withoutAnimation { wet.update(points: points, color: style.color, width: style.width, pressure: style.pressure, kind: style.kind) }
     }
 
     private func moveStroke(_ touch: UITouch, event: UIEvent?, samples: [UITouch]) {
@@ -423,10 +434,12 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private func endStroke(_ touch: UITouch, commit: Bool) {
         holdTimer?.invalidate()
         holdTimer = nil
+        let recording = wetRecording
         defer {
             wet = nil
             wetPoints = []
             wetStyle = nil
+            wetRecording = nil
             snapped = nil
         }
         guard let live = wet, let style = wetStyle else { return }
@@ -450,8 +463,9 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
             return
         }
         let pressure = snapped == nil ? style.pressure : 0 // snapped shapes have a constant width
-        let stroke = InkStroke(kind: style.kind, color: style.color, width: style.width, pressure: pressure, points: points)
-        withoutAnimation { live.update(points: stroke.points, color: stroke.color, width: stroke.width, pressure: stroke.pressure) }
+        let stroke = InkStroke(kind: style.kind, color: style.color, width: style.width, pressure: pressure, points: points,
+                               recordingID: recording?.id, recordingOffset: recording?.offset)
+        withoutAnimation { live.update(points: stroke.points, color: stroke.color, width: stroke.width, pressure: stroke.pressure, kind: stroke.kind) }
         layers[stroke.id] = live // the live layers become the stroke's layers, so sync() keeps them
         store.add(stroke, on: page)
     }
@@ -620,6 +634,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         let loop = CGMutablePath()
         loop.addLines(between: lassoPoints)
         loop.closeSubpath()
+        lastLassoPolygon = lassoPoints
         selection = Set(store.strokes(on: page).filter { InkGeometry.isSelected($0, by: loop) }.map(\.id))
         resetSelectionFrame()
         updateSelectionVisual()
@@ -929,10 +944,15 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
                              suggestedActions: [UIMenuElement]) -> UIMenu? {
         UIMenu(children: [
+            UIAction(title: "AI로 설명", image: UIImage(systemName: "sparkles")) { [weak self] _ in self?.explainSelection() },
             UIAction(title: "복사", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in self?.copySelection() },
             UIAction(title: "복제", image: UIImage(systemName: "plus.square.on.square")) { [weak self] _ in self?.duplicateSelection() },
             UIAction(title: "삭제", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in self?.deleteSelection() },
         ])
+    }
+
+    private func explainSelection() {
+        onExplainSelection?(selectedStrokes, lastLassoPolygon)
     }
 
     private func copySelection() {
