@@ -72,6 +72,32 @@ final class LibraryTests: XCTestCase {
         XCTAssertTrue(Library.all().first?.favorite ?? false)
     }
 
+    func testBookmarkToggleAddsAndRemovesAPage() throws {
+        let doc = try Library.createBlank(title: "노트")
+        XCTAssertTrue(Library.bookmarkedPages(for: doc).isEmpty)
+
+        Library.toggleBookmark(2, for: doc)
+        Library.toggleBookmark(5, for: doc)
+        XCTAssertEqual(Library.bookmarkedPages(for: doc), [2, 5])
+
+        Library.toggleBookmark(2, for: doc)
+        XCTAssertEqual(Library.bookmarkedPages(for: doc), [5])
+    }
+
+    // Simulates a meta.json written by a build before bookmarkedPages existed: the key is simply absent.
+    func testMetaDecodesAFileMissingANewerFieldAsEmpty() throws {
+        let folder = tempRoot.appending(path: "doc")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let old = ["title": "3주차", "favorite": true] as [String: Any]
+        let data = try JSONSerialization.data(withJSONObject: old)
+        try data.write(to: folder.appending(path: "meta.json"))
+
+        let loaded = DocumentMeta.load(from: folder)
+        XCTAssertEqual(loaded.title, "3주차")
+        XCTAssertTrue(loaded.favorite)
+        XCTAssertTrue(loaded.bookmarkedPages.isEmpty)
+    }
+
     func testBlankNoteHasOnePageAndIsFindableAfterward() throws {
         let doc = try Library.createBlank(title: "빈 노트")
         XCTAssertEqual(doc.pageCount, 1)

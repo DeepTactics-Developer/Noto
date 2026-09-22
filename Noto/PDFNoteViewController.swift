@@ -81,11 +81,18 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PKToo
         model.scrollToPage = { [weak self] index in self?.scrollToPage(index) }
     }
 
-    // Called by the thumbnail sidebar. `frames` is always in the unscaled (zoomScale 1) coordinate space that
-    // scrollRectToVisible expects, regardless of the current zoom.
+    // Called by the thumbnail sidebar. scrollRectToVisible only guarantees the rect becomes visible with the
+    // least motion, which for a page taller than the viewport can land on its bottom half (or even leave the
+    // scroll short of the page, reading as the wrong page). Converting the page's top through the content view
+    // instead targets that exact point at the very top of the viewport, correct at any zoom level.
     private func scrollToPage(_ index: Int) {
         guard frames.indices.contains(index) else { return }
-        scrollView.scrollRectToVisible(frames[index], animated: true)
+        let top = contentView.convert(CGPoint(x: 0, y: frames[index].minY), to: scrollView)
+        let bottomRight = contentView.convert(CGPoint(x: contentView.bounds.width, y: contentView.bounds.height), to: scrollView)
+        let maxX = max(0, bottomRight.x - scrollView.bounds.width)
+        let maxY = max(0, bottomRight.y - scrollView.bounds.height)
+        let target = CGPoint(x: min(max(top.x, 0), maxX), y: min(max(top.y, 0), maxY))
+        scrollView.setContentOffset(target, animated: true)
     }
 
     private func updateCurrentPage() {

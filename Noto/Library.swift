@@ -35,6 +35,26 @@ struct DocumentMeta: Codable {
     var title: String
     var subjectID: UUID?
     var favorite: Bool = false
+    var bookmarkedPages: Set<Int> = []
+
+    init(title: String, subjectID: UUID? = nil, favorite: Bool = false, bookmarkedPages: Set<Int> = []) {
+        self.title = title
+        self.subjectID = subjectID
+        self.favorite = favorite
+        self.bookmarkedPages = bookmarkedPages
+    }
+
+    // Custom decode so a meta.json saved by an older build of the app (missing a field added since) still opens,
+    // the same way the fallback to title.txt below handles files from before meta.json existed at all.
+    private enum CodingKeys: String, CodingKey { case title, subjectID, favorite, bookmarkedPages }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        title = try container.decode(String.self, forKey: .title)
+        subjectID = try container.decodeIfPresent(UUID.self, forKey: .subjectID)
+        favorite = try container.decodeIfPresent(Bool.self, forKey: .favorite) ?? false
+        bookmarkedPages = try container.decodeIfPresent(Set<Int>.self, forKey: .bookmarkedPages) ?? []
+    }
 
     static func load(from folder: URL) -> DocumentMeta {
         let metaURL = folder.appending(path: "meta.json")
@@ -165,6 +185,16 @@ enum Library {
     static func setSubject(_ subjectID: UUID?, for document: DocumentFolder) {
         var meta = DocumentMeta.load(from: document.url)
         meta.subjectID = subjectID
+        try? meta.save(to: document.url)
+    }
+
+    static func bookmarkedPages(for document: DocumentFolder) -> Set<Int> {
+        DocumentMeta.load(from: document.url).bookmarkedPages
+    }
+
+    static func toggleBookmark(_ page: Int, for document: DocumentFolder) {
+        var meta = DocumentMeta.load(from: document.url)
+        if meta.bookmarkedPages.contains(page) { meta.bookmarkedPages.remove(page) } else { meta.bookmarkedPages.insert(page) }
         try? meta.save(to: document.url)
     }
 }
