@@ -114,10 +114,17 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private let selectionLayer = NoActionShapeLayer()
     private var lassoPoints: [CGPoint] = []
     private var selection: Set<UUID> = []
-    private var selectionBounds = CGRect.null
     private var dragStart = CGPoint.zero
     private var dragOffset = CGSize.zero
     private var menu: UIEditMenuInteraction?
+
+    // The selection's own frame, independent of how the strokes it holds happen to be stored: `selectionAngle`
+    // persists across gestures (a rotate adds to it, a resize/move leave it alone) instead of being re-derived
+    // as a fresh axis-aligned box every time, which is what made a rotated selection's outline and handles snap
+    // back to looking un-rotated the moment you let go.
+    private var selectionCenter = CGPoint.zero // absolute page coordinates
+    private var selectionSize = CGSize.zero // width/height in the selection's own (unrotated) local frame
+    private var selectionAngle: CGFloat = 0 // accumulated rotation, radians
 
     // resize (bottom-right handle, opposite corner as pivot) / rotate (handle above top-center, pivot = center;
     // snaps to right angles). Real UIViews with their own pan gesture, not raw touch hit-testing: UIKit's own
@@ -125,11 +132,15 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private let resizeHandleView = SelectionHandleView()
     private let rotateHandleView = SelectionHandleView()
     private let rotateHandleLine = NoActionShapeLayer() // purely visual connector, not itself interactive
+    private enum TransformKind { case resize, rotate }
+    private var transformKind: TransformKind?
     private var transformPivot = CGPoint.zero
     private var transformStartVector = CGPoint.zero
     private var resizeHandleOrigin = CGPoint.zero // the handle's own position before the live preview moves it
     private var rotateHandleOrigin = CGPoint.zero
     private var pendingTransform = CGAffineTransform.identity
+    private var liveScale: CGFloat = 1
+    private var liveAngle: CGFloat = 0
     private var rotationSnapped = false
     private let handleTouchTarget: CGFloat = 32 // screen points, constant regardless of zoom
     private let rotateHandleOffset: CGFloat = 28 // screen points, above the selection
@@ -224,6 +235,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
             }
             if !selection.isSubset(of: ids) {
                 selection.formIntersection(ids)
+                resetSelectionFrame()
                 updateSelectionVisual()
             }
         }
@@ -540,26 +552,73 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         loop.addLines(between: lassoPoints)
         loop.closeSubpath()
         selection = Set(store.strokes(on: page).filter { InkGeometry.isSelected($0, by: loop) }.map(\.id))
+        resetSelectionFrame()
         updateSelectionVisual()
         if !selection.isEmpty { presentMenu() }
     }
 
-    private func updateSelectionVisual() {
+    // A fresh, axis-aligned frame around whatever is currently selected. Called whenever the selection itself
+    // changes (a new lasso, duplicate, or an external edit shrinking it) — not after a resize/rotate/move, which
+    // update the existing frame incrementally instead so its remembered orientation survives.
+    private func resetSelectionFrame() {
         let strokes = selectedStrokes
+        guard var box = strokes.first?.bounds else {
+            selectionCenter = .zero
+            selectionSize = .zero
+            selectionAngle = 0
+            return
+        }
+        for stroke in strokes.dropFirst() { box = box.union(stroke.bounds) }
+        let padded = box.insetBy(dx: -8, dy: -8)
+        selectionCenter = CGPoint(x: padded.midX, y: padded.midY)
+        selectionSize = padded.size
+        selectionAngle = 0
+    }
+
+    // `offset` in the selection's own local (unrotated) frame, rotated to its actual place in the page.
+    private func worldPoint(localOffset offset: CGPoint) -> CGPoint {
+        let c = cos(selectionAngle), s = sin(selectionAngle)
+        return CGPoint(x: selectionCenter.x + offset.x * c - offset.y * s, y: selectionCenter.y + offset.x * s + offset.y * c)
+    }
+
+    // Top-left, top-right, bottom-right, bottom-left, in world space — bottom-right is the resize handle, and
+    // top-left is its pivot (the opposite corner).
+    private var selectionCorners: [CGPoint] {
+        let half = CGPoint(x: selectionSize.width / 2, y: selectionSize.height / 2)
+        return [CGPoint(x: -half.x, y: -half.y), CGPoint(x: half.x, y: -half.y),
+               CGPoint(x: half.x, y: half.y), CGPoint(x: -half.x, y: half.y)].map(worldPoint(localOffset:))
+    }
+
+    private var selectionRotateHandlePoint: CGPoint {
+        worldPoint(localOffset: CGPoint(x: 0, y: -selectionSize.height / 2 - rotateHandleOffset / screenPerPagePoint))
+    }
+
+    // The axis-aligned box enclosing the (possibly rotated) selection — only for the "tap inside to drag" hit
+    // test and the edit menu's anchor point, where an exact rotated hit test would be more precision than it's worth.
+    private var selectionBounds: CGRect {
+        let corners = selectionCorners
+        let xs = corners.map(\.x), ys = corners.map(\.y)
+        guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return .null }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    private func updateSelectionVisual() {
         withoutAnimation {
-            guard var box = strokes.first?.bounds else {
+            guard !selection.isEmpty else {
                 selectionLayer.removeFromSuperlayer()
                 rotateHandleLine.removeFromSuperlayer()
                 resizeHandleView.isHidden = true
                 rotateHandleView.isHidden = true
-                selectionBounds = .null
                 return
             }
-            for stroke in strokes.dropFirst() { box = box.union(stroke.bounds) }
-            selectionBounds = box.insetBy(dx: -8, dy: -8)
 
             selectionLayer.transform = CATransform3DIdentity
-            selectionLayer.path = CGPath(roundedRect: selectionBounds, cornerWidth: 4, cornerHeight: 4, transform: nil)
+            let corners = selectionCorners
+            let path = CGMutablePath()
+            path.move(to: corners[0])
+            corners.dropFirst().forEach { path.addLine(to: $0) }
+            path.closeSubpath()
+            selectionLayer.path = path
             selectionLayer.removeFromSuperlayer()
             host.layer.addSublayer(selectionLayer)
 
@@ -568,21 +627,21 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
 
             resizeHandleView.transform = .identity
             resizeHandleView.bounds = CGRect(origin: .zero, size: targetSize)
-            resizeHandleView.center = CGPoint(x: selectionBounds.maxX, y: selectionBounds.maxY)
+            resizeHandleView.center = corners[2] // bottom-right, in the selection's own (possibly rotated) frame
             resizeHandleView.isHidden = false
             host.bringSubviewToFront(resizeHandleView)
 
-            let rotateCenter = CGPoint(x: selectionBounds.midX, y: selectionBounds.minY - rotateHandleOffset / screenPerPagePoint)
+            let rotatePoint = selectionRotateHandlePoint
             rotateHandleView.transform = .identity
             rotateHandleView.bounds = CGRect(origin: .zero, size: targetSize)
-            rotateHandleView.center = rotateCenter
+            rotateHandleView.center = rotatePoint
             rotateHandleView.isHidden = false
             host.bringSubviewToFront(rotateHandleView)
 
             rotateHandleLine.transform = CATransform3DIdentity
             let line = CGMutablePath()
-            line.move(to: CGPoint(x: selectionBounds.midX, y: selectionBounds.minY))
-            line.addLine(to: rotateCenter)
+            line.move(to: worldPoint(localOffset: CGPoint(x: 0, y: -selectionSize.height / 2)))
+            line.addLine(to: rotatePoint)
             rotateHandleLine.path = line
             rotateHandleLine.removeFromSuperlayer()
             host.layer.addSublayer(rotateHandleLine)
@@ -596,11 +655,6 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         menu?.dismissMenu()
     }
 
-    // The rotate handle's resting position, before any live drag/transform offset.
-    private var rotateHandleBaseCenter: CGPoint {
-        CGPoint(x: selectionBounds.midX, y: selectionBounds.minY - rotateHandleOffset / screenPerPagePoint)
-    }
-
     // While dragging, the selected layers (and the handles) are only shifted; the strokes are rewritten when
     // the pen lifts. Pure translation, so — unlike resize/rotate below — it needs no anchor-point juggling.
     private func applyDrag() {
@@ -609,9 +663,10 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
             for id in selection { layers[id]?.group.transform = shift }
             selectionLayer.transform = shift
             rotateHandleLine.transform = shift
-            resizeHandleView.center = CGPoint(x: selectionBounds.maxX + dragOffset.width, y: selectionBounds.maxY + dragOffset.height)
-            let base = rotateHandleBaseCenter
-            rotateHandleView.center = CGPoint(x: base.x + dragOffset.width, y: base.y + dragOffset.height)
+            let corner = selectionCorners[2]
+            resizeHandleView.center = CGPoint(x: corner.x + dragOffset.width, y: corner.y + dragOffset.height)
+            let rotatePoint = selectionRotateHandlePoint
+            rotateHandleView.center = CGPoint(x: rotatePoint.x + dragOffset.width, y: rotatePoint.y + dragOffset.height)
         }
     }
 
@@ -627,6 +682,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         let old = selection
         store.replace(remove: old, insert: moved, on: page)
         selection = Set(moved.map(\.id))
+        selectionCenter = CGPoint(x: selectionCenter.x + offset.width, y: selectionCenter.y + offset.height)
         updateSelectionVisual()
         presentMenu()
     }
@@ -638,14 +694,16 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private func handleResizePan(_ gesture: UIPanGestureRecognizer) {
         switch gesture.state {
         case .began:
-            beginTransform(pivot: CGPoint(x: selectionBounds.minX, y: selectionBounds.minY), at: gesture.location(in: host))
+            transformKind = .resize
+            liveScale = 1
+            beginTransform(pivot: selectionCorners[0], at: gesture.location(in: host)) // opposite (top-left) corner, fixed
         case .changed:
             let p = gesture.location(in: host)
             let current = CGPoint(x: p.x - transformPivot.x, y: p.y - transformPivot.y)
             let startLength = hypot(transformStartVector.x, transformStartVector.y)
             guard startLength > 1 else { return }
-            let scale = max(0.2, min(6, hypot(current.x, current.y) / startLength))
-            applyTransformPreview(CGAffineTransform(scaleX: scale, y: scale))
+            liveScale = max(0.2, min(6, hypot(current.x, current.y) / startLength))
+            applyTransformPreview(CGAffineTransform(scaleX: liveScale, y: liveScale))
         case .ended, .cancelled:
             endTransform(commit: gesture.state == .ended)
         default:
@@ -656,12 +714,14 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private func handleRotatePan(_ gesture: UIPanGestureRecognizer) {
         switch gesture.state {
         case .began:
+            transformKind = .rotate
             rotationSnapped = false
-            beginTransform(pivot: CGPoint(x: selectionBounds.midX, y: selectionBounds.midY), at: gesture.location(in: host))
+            liveAngle = 0
+            beginTransform(pivot: selectionCenter, at: gesture.location(in: host))
         case .changed:
             let p = gesture.location(in: host)
             let current = CGPoint(x: p.x - transformPivot.x, y: p.y - transformPivot.y)
-            var angle = atan2(current.y, current.x) - atan2(transformStartVector.y, transformStartVector.x)
+            var angle = normalizedAngle(atan2(current.y, current.x) - atan2(transformStartVector.y, transformStartVector.x))
             let step = CGFloat.pi / 2
             let nearest = (angle / step).rounded() * step
             let snapped = abs(angle - nearest) <= rotationSnapThreshold
@@ -670,12 +730,22 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
                 rotationSnapped = snapped
                 UISelectionFeedbackGenerator().selectionChanged() // a tick as it locks on or lets go
             }
+            liveAngle = angle
             applyTransformPreview(CGAffineTransform(rotationAngle: angle))
         case .ended, .cancelled:
             endTransform(commit: gesture.state == .ended)
         default:
             break
         }
+    }
+
+    // atan2's difference can otherwise land outside (-π, π] right as the pen crosses behind the pivot, which
+    // would read as a huge jump instead of the small turn it actually was.
+    private func normalizedAngle(_ angle: CGFloat) -> CGFloat {
+        var a = angle.truncatingRemainder(dividingBy: 2 * .pi)
+        if a > .pi { a -= 2 * .pi }
+        if a < -.pi { a += 2 * .pi }
+        return a
     }
 
     // Re-anchors every selected layer (plus the selection outline and the rotate handle's connector line) at
@@ -740,7 +810,10 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
 
     private func endTransform(commit: Bool) {
         let transform = pendingTransform
+        let kind = transformKind
+        let pivot = transformPivot
         pendingTransform = .identity
+        transformKind = nil
         resetTransformAnchors()
         guard commit, transform != .identity else {
             updateSelectionVisual() // nothing written to the store; lay the handles back out from scratch
@@ -751,6 +824,18 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         let old = selection
         store.replace(remove: old, insert: transformed, on: page)
         selection = Set(transformed.map(\.id))
+        switch kind {
+        case .resize:
+            // The opposite corner stayed fixed; the frame just grew/shrank from there, in its existing orientation.
+            selectionSize = CGSize(width: selectionSize.width * liveScale, height: selectionSize.height * liveScale)
+            let half = CGPoint(x: selectionSize.width / 2, y: selectionSize.height / 2)
+            let c = cos(selectionAngle), s = sin(selectionAngle)
+            selectionCenter = CGPoint(x: pivot.x + half.x * c - half.y * s, y: pivot.y + half.x * s + half.y * c)
+        case .rotate:
+            selectionAngle += liveAngle
+        case nil:
+            break
+        }
         updateSelectionVisual()
         presentMenu()
     }
@@ -786,6 +871,7 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         guard !copies.isEmpty else { return }
         store.replace(remove: [], insert: copies, on: page)
         selection = Set(copies.map(\.id))
+        resetSelectionFrame()
         updateSelectionVisual()
         presentMenu()
     }
@@ -822,7 +908,7 @@ private final class SelectionHandleView: UIView {
         addSubview(dot)
 
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
-        pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)] // fingers only, like every other manipulation
+        pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue), NSNumber(value: UITouch.TouchType.pencil.rawValue)]
         pan.maximumNumberOfTouches = 1
         addGestureRecognizer(pan)
     }
