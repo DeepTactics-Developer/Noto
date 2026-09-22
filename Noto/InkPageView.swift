@@ -680,8 +680,12 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         }
         let moved = selectedStrokes.map { $0.moved(by: offset) }
         let old = selection
-        store.replace(remove: old, insert: moved, on: page)
+        // `selection` must already name the new strokes *before* store.replace runs: replacing strokes fires
+        // sync() synchronously, and sync() resets the selection frame the moment it sees `selection` pointing
+        // at strokes the store no longer has — which, since every edit here mints fresh ids, is true of `old`
+        // for the rest of this function. Updating `selection` first keeps sync() from ever seeing that gap.
         selection = Set(moved.map(\.id))
+        store.replace(remove: old, insert: moved, on: page)
         selectionCenter = CGPoint(x: selectionCenter.x + offset.width, y: selectionCenter.y + offset.height)
         updateSelectionVisual()
         presentMenu()
@@ -822,8 +826,8 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         }
         let transformed = selectedStrokes.map { $0.transformed(by: transform) }
         let old = selection
+        selection = Set(transformed.map(\.id)) // see the comment in endMove: must happen before store.replace
         store.replace(remove: old, insert: transformed, on: page)
-        selection = Set(transformed.map(\.id))
         switch kind {
         case .resize:
             // The opposite corner stayed fixed; the frame just grew/shrank from there, in its existing orientation.
@@ -869,8 +873,8 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
     private func duplicateSelection() {
         let copies = selectedStrokes.map { $0.moved(by: CGSize(width: 24, height: 24)) }
         guard !copies.isEmpty else { return }
+        selection = Set(copies.map(\.id)) // see the comment in endMove: must happen before store.replace
         store.replace(remove: [], insert: copies, on: page)
-        selection = Set(copies.map(\.id))
         resetSelectionFrame()
         updateSelectionVisual()
         presentMenu()
@@ -878,7 +882,9 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
 
     private func deleteSelection() {
         store.replace(remove: selection, insert: [], on: page)
-        clearSelection()
+        selection = []
+        updateSelectionVisual()
+        menu?.dismissMenu()
     }
 
     // Pastes onto THIS page (may be a different page, or even a different document, from where the copy was
