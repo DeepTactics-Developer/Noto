@@ -638,7 +638,17 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
         selection = Set(store.strokes(on: page).filter { InkGeometry.isSelected($0, by: loop) }.map(\.id))
         resetSelectionFrame()
         updateSelectionVisual()
-        if !selection.isEmpty { presentMenu() }
+        if !selection.isEmpty {
+            presentMenu()
+        } else {
+            // No ink under the loop doesn't mean nothing was selected — there may be PDF text there. Show the
+            // menu anyway (editMenuInteraction below hides the ink-only actions when selection is empty), so
+            // "AI로 설명" still works purely on PDF text with no handwriting over it.
+            let xs = lastLassoPolygon.map(\.x), ys = lastLassoPolygon.map(\.y)
+            guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min() else { return }
+            let anchor = CGPoint(x: (minX + maxX) / 2 * scale, y: minY * scale)
+            menu?.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: anchor))
+        }
     }
 
     // A fresh, axis-aligned frame around whatever is currently selected. Called whenever the selection itself
@@ -943,12 +953,19 @@ final class InkPageView: UIView, UIEditMenuInteractionDelegate {
 
     func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
                              suggestedActions: [UIMenuElement]) -> UIMenu? {
-        UIMenu(children: [
+        var actions: [UIMenuElement] = [
             UIAction(title: "AI로 설명", image: UIImage(systemName: "sparkles")) { [weak self] _ in self?.explainSelection() },
-            UIAction(title: "복사", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in self?.copySelection() },
-            UIAction(title: "복제", image: UIImage(systemName: "plus.square.on.square")) { [weak self] _ in self?.duplicateSelection() },
-            UIAction(title: "삭제", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in self?.deleteSelection() },
-        ])
+        ]
+        // Copy/duplicate/delete only make sense with ink actually selected — a lasso over plain PDF text with
+        // no handwriting still gets here (see endLasso) purely so "AI로 설명" is reachable.
+        if !selection.isEmpty {
+            actions += [
+                UIAction(title: "복사", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in self?.copySelection() },
+                UIAction(title: "복제", image: UIImage(systemName: "plus.square.on.square")) { [weak self] _ in self?.duplicateSelection() },
+                UIAction(title: "삭제", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in self?.deleteSelection() },
+            ]
+        }
+        return UIMenu(children: actions)
     }
 
     private func explainSelection() {

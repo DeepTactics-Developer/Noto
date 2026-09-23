@@ -61,12 +61,34 @@ struct DocumentTextIndex {
     }
 }
 
+// Turns FoundationModels' own English error text into something a Korean-speaking user can act on. Matched by
+// substring against the real strings this framework has been observed to produce (e.g. "Exceeded model context
+// window size", "Detected content likely to be unsafe") rather than typed error cases, since those are the only
+// form of this available without a device to confirm exact enum shapes against.
+enum AIErrorMessage {
+    static func friendly(for error: Error) -> String {
+        let text = error.localizedDescription.lowercased()
+        if text.contains("unsafe") {
+            return "AI가 이 내용을 처리할 수 없다고 판단했습니다. 다른 부분을 선택하거나 필기가 정확히 인식됐는지 확인해보세요."
+        }
+        if text.contains("context window") || text.contains("exceeded") {
+            return "내용이 너무 길어 처리하지 못했습니다. 선택 범위를 줄이거나 다시 시도해보세요."
+        }
+        return error.localizedDescription
+    }
+
+    static func isContextWindowError(_ error: Error) -> Bool {
+        let text = error.localizedDescription.lowercased()
+        return text.contains("context window") || text.contains("exceeded")
+    }
+}
+
 #if canImport(FoundationModels)
 @available(iOS 26.0, *)
 enum AIAssistant {
     static func answer(question: String, index: DocumentTextIndex) async throws -> String {
         let pages = index.relevantPages(to: question)
-        let excerpt = pages.map { "[p.\($0 + 1)]\n\(index.pages[$0].prefix(1200))" }.joined(separator: "\n\n")
+        let excerpt = pages.map { "[p.\($0 + 1)]\n\(index.pages[$0].prefix(900))" }.joined(separator: "\n\n")
         let session = LanguageModelSession(instructions: """
             너는 사용자가 보고 있는 PDF 문서 내용만 근거로 답하는 도우미야. 아래는 문서에서 발췌한 페이지들이다.
             답변은 한국어로 간결하게 하고, 근거로 쓴 페이지 번호를 문장 끝에 (p.N) 형식으로 표시해.
@@ -77,22 +99,38 @@ enum AIAssistant {
     }
 
     // For the lasso selection's own "AI로 설명" — explains exactly the given content (PDF text + recognized
-    // handwriting from inside the lasso), not a document-wide search like `answer`.
+    // handwriting from inside the lasso), not a document-wide search like `answer`. Capped defensively: a lasso
+    // can enclose a lot of PDF text, and unlike answer()/summarize() nothing upstream already bounds this one.
     static func explainSelection(_ content: String) async throws -> String {
         let session = LanguageModelSession(instructions: """
             사용자가 문서에서 선택한 내용이야. 한국어로 간결하게 설명해줘. 선택 내용이 수식이나 개념이면 풀어서,
             문장이면 요점을, 목록이면 각 항목의 의미를 설명해.
             """)
-        let response = try await session.respond(to: content)
+        let response = try await session.respond(to: String(content.prefix(4000)))
         return response.content
     }
 
     // Walks pages in order, taking as much of each as fits a fixed character budget — keeps the whole document
     // representable without blowing past the on-device model's context window, at the cost of skipping the tail
-    // of a very long document (mentioned to the model so it can say so in the summary).
+    // of a very long document (mentioned to the model so it can say so in the summary). The real limit isn't
+    // known precisely (and likely varies with how dense the document's own text is), so on an "exceeded context
+    // window" error this retries with a shrinking budget rather than just failing.
     static func summarize(index: DocumentTextIndex, pageRange: Range<Int>? = nil) async throws -> String {
         let pages = pageRange.map(Array.init) ?? Array(index.pages.indices)
-        var budget = 8000
+        var lastError: Error?
+        for budget in [4000, 2000, 1000] {
+            do {
+                return try await summarizeAttempt(index: index, pages: pages, budget: budget)
+            } catch {
+                guard AIErrorMessage.isContextWindowError(error) else { throw error }
+                lastError = error
+            }
+        }
+        throw lastError ?? CancellationError()
+    }
+
+    private static func summarizeAttempt(index: DocumentTextIndex, pages: [Int], budget initialBudget: Int) async throws -> String {
+        var budget = initialBudget
         var parts: [String] = []
         for page in pages {
             guard budget > 0 else { break }
@@ -109,8 +147,8 @@ enum AIAssistant {
     }
 
     static func outline(index: DocumentTextIndex) async throws -> [(title: String, page: Int)] {
-        let cap = min(30, index.pages.count) // keeps the prompt bounded on very long documents
-        let excerpt = (0..<cap).map { "[p.\($0 + 1)] \(index.pages[$0].prefix(300))" }.joined(separator: "\n")
+        let cap = min(20, index.pages.count) // keeps the prompt bounded on very long documents
+        let excerpt = (0..<cap).map { "[p.\($0 + 1)] \(index.pages[$0].prefix(250))" }.joined(separator: "\n")
         let session = LanguageModelSession(instructions: """
             아래는 문서의 페이지별 내용이다. 목차를 만들어줘. 한 줄에 하나씩 "제목 — p.N" 형식으로만 출력하고 다른 말은 하지 마.
             """)

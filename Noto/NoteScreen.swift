@@ -43,6 +43,17 @@ enum PenKind: String, CaseIterable, Identifiable, Codable {
         case .marker: .marker
         }
     }
+    // Seeded into ToolState.penWidth when switching to this kind (see ToolOptionsPill), so a kind that should
+    // look obviously different — the marker especially — does, immediately, without the user having to also
+    // reach for the width slider. They can still adjust it afterward same as any other kind.
+    var defaultWidth: Double {
+        switch self {
+        case .pen: 3
+        case .pencil: 2.5
+        case .fountainPen: 4
+        case .marker: 14
+        }
+    }
 }
 
 // The toolbar's own state, replacing PencilKit's system palette. A plain Equatable value so SwiftUI's
@@ -209,7 +220,7 @@ struct NoteScreen: View {
         .sheet(isPresented: $showingFlashcards) { FlashcardsView(folder: folder) }
         .sheet(isPresented: $showingAI) {
             if let pdf {
-                AIAssistantView(document: pdf, onJumpToPage: { model.scrollToPage?($0) }, selectionToExplain: explainSelectionText)
+                AIAssistantView(document: pdf, folder: folder, onJumpToPage: { model.scrollToPage?($0) }, selectionToExplain: explainSelectionText)
             }
         }
         .onAppear(perform: load)
@@ -396,7 +407,10 @@ private struct ToolOptionsPill: View {
             if toolState.tool == .pen {
                 HStack(spacing: 4) {
                     ForEach(PenKind.allCases) { kind in
-                        Button { toolState.penKind = kind } label: {
+                        Button {
+                            toolState.penKind = kind
+                            toolState.penWidth = kind.defaultWidth
+                        } label: {
                             VStack(spacing: 2) {
                                 Image(systemName: kind.icon).font(.system(size: 14))
                                 Text(kind.label).font(.system(size: 9))
@@ -607,6 +621,8 @@ private struct RecordingList: View {
     @State private var transcribingID: UUID?
     @State private var transcribeError: String?
     @State private var showingTranscript: Recording?
+    @State private var pendingDelete: Recording?
+    @Environment(\.dismiss) private var dismissPopover
 
     var body: some View {
         ScrollView {
@@ -628,15 +644,13 @@ private struct RecordingList: View {
                             if transcribingID == recording.id {
                                 ProgressView().controlSize(.small)
                             } else {
-                                Button { Task { await showTranscript(recording) } } label: {
-                                    Image(systemName: recording.transcript == nil ? "text.bubble" : "text.bubble.fill")
-                                }
+                                Button { Task { await showTranscript(recording) } } label: { Image(systemName: "text.bubble") }
                             }
-                            Button { model.scrollToPage?(recording.pageIndex) } label: { Image(systemName: "arrow.right.circle") }
-                            Button(role: .destructive) {
-                                RecordingStore.delete(recording.id, for: folder)
-                                recordings = RecordingStore.all(for: folder)
-                            } label: { Image(systemName: "trash") }
+                            Button {
+                                model.scrollToPage?(recording.pageIndex)
+                                dismissPopover() // otherwise the scroll happens invisibly behind this popover
+                            } label: { Image(systemName: "arrow.right.circle") }
+                            Button(role: .destructive) { pendingDelete = recording } label: { Image(systemName: "trash") }
                         }
                         .buttonStyle(.plain)
                         .font(.caption)
@@ -656,6 +670,15 @@ private struct RecordingList: View {
         .alert("텍스트로 바꾸지 못했습니다", isPresented: .constant(transcribeError != nil), presenting: transcribeError) { _ in
             Button("확인") { transcribeError = nil }
         } message: { Text($0) }
+        .confirmationDialog("녹음을 삭제할까요?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
+                            titleVisibility: .visible, presenting: pendingDelete) { recording in
+            Button("삭제", role: .destructive) {
+                RecordingStore.delete(recording.id, for: folder)
+                recordings = RecordingStore.all(for: folder)
+            }
+        } message: { _ in
+            Text("되돌릴 수 없습니다.")
+        }
     }
 
     // Transcribed on demand, not eagerly — "텍스트 보기" is the only thing that ever triggers this, so the

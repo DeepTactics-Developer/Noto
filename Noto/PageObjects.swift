@@ -434,12 +434,19 @@ final class ImageBoxView: UIView {
     private(set) var isDragging = false
     private let imageView = UIImageView()
     private let deleteButton = UIButton(type: .system)
+    private let pan: UIPanGestureRecognizer
+    private let pinch: UIPinchGestureRecognizer
 
-    // See the matching property on TextBoxView: the delete button only shows while selected.
+    // See the matching property on TextBoxView: the delete button only shows while selected. Drag/pinch are
+    // ALSO gated on it (unlike TextBoxView, where the pan lives on the handle bar and is already gated for
+    // free by that bar being hidden) — otherwise a finger landing on an unselected image moves it immediately,
+    // before the user ever sees anything indicating it's about to.
     var isSelected = false {
         didSet {
             guard isSelected != oldValue else { return }
             deleteButton.isHidden = !isSelected
+            pan.isEnabled = isSelected
+            pinch.isEnabled = isSelected
         }
     }
 
@@ -451,6 +458,14 @@ final class ImageBoxView: UIView {
 
     init(id: UUID, image: UIImage) {
         self.id = id
+        let fingers = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        pan = UIPanGestureRecognizer()
+        pan.allowedTouchTypes = fingers
+        pan.maximumNumberOfTouches = 1
+        pan.isEnabled = false
+        pinch = UIPinchGestureRecognizer()
+        pinch.allowedTouchTypes = fingers
+        pinch.isEnabled = false
         super.init(frame: .zero)
         imageView.image = image
         imageView.contentMode = .scaleAspectFit
@@ -468,12 +483,8 @@ final class ImageBoxView: UIView {
         deleteButton.addTarget(self, action: #selector(deleteTapped), for: .touchUpInside)
         addSubview(deleteButton)
 
-        let fingers = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
-        pan.allowedTouchTypes = fingers
-        pan.maximumNumberOfTouches = 1
-        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
-        pinch.allowedTouchTypes = fingers
+        pan.addTarget(self, action: #selector(handlePan(_:)))
+        pinch.addTarget(self, action: #selector(handlePinch(_:)))
         addGestureRecognizer(pan)
         addGestureRecognizer(pinch)
     }

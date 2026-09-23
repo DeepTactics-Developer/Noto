@@ -130,11 +130,12 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
     // was drawn around this point in the recording, following it to a different page if needed — the reverse
     // of Notability's audio-follows-your-tap, this is ink-follows-the-audio.
     private func highlightPlayback(recordingID: UUID, at seconds: TimeInterval) {
+        guard AppSettings.audioSyncAutoScroll || AppSettings.audioSyncHighlight else { return }
         if recordingID != highlightedRecordingID {
             highlightedRecordingID = recordingID
             highlightedStrokeIDs = []
         }
-        let window: Float = 0.6 // seconds either side of the playhead still counts as "being written now"
+        let window: Float = 0.9 // seconds either side of the playhead still counts as "being written now"
         var matched: [(page: Int, stroke: InkStroke)] = []
         for page in pages.indices {
             for stroke in store.strokes(on: page) where stroke.recordingID == recordingID {
@@ -145,7 +146,10 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         }
         guard !matched.isEmpty else { return }
         highlightedStrokeIDs.formUnion(matched.map { $0.stroke.id })
-        if let firstPage = matched.map(\.page).min(), model.currentPage != firstPage { scrollToPage(firstPage) }
+        if AppSettings.audioSyncAutoScroll, let firstPage = matched.map(\.page).min(), model.currentPage != firstPage {
+            scrollToPage(firstPage)
+        }
+        guard AppSettings.audioSyncHighlight else { return }
         for (page, stroke) in matched { flashHighlight(page: page, rectInPage: stroke.bounds) }
     }
 
@@ -601,7 +605,7 @@ final class PDFNoteViewController: UIViewController, UIScrollViewDelegate, PHPic
         switch state.tool {
         case .pen:
             var color = Self.rgba(UIColor(state.penColor))
-            if state.penKind == .pencil { color[3] *= 0.82 } // a touch of translucency reads as graphite, not ink
+            if state.penKind == .pencil { color[3] *= 0.6 } // translucent enough to read as graphite even next to plain pen
             mode = .draw(kind: state.penKind.inkKind, color: color, width: Float(state.penWidth))
         case .highlighter:
             var color = Self.rgba(UIColor(state.highlighterColor))

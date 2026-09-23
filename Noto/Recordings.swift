@@ -103,14 +103,17 @@ final class VoiceRecorder: NSObject, AVAudioRecorderDelegate {
     private func beginRecording(in folder: DocumentFolder) {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+            // .spokenAudio tunes the session's own signal processing for speech specifically (vs. music/.default),
+            // which is what a lecture recording actually is — matters for how well Transcriber can read it back.
+            try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker])
             try session.setActive(true)
             let name = "rec_\(UUID().uuidString).m4a"
             let settings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: 44100,
                 AVNumberOfChannelsKey: 1,
-                AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue,
+                AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
+                AVEncoderBitRateKey: 96000,
             ]
             let newRecorder = try AVAudioRecorder(url: folder.fileURL(name), settings: settings)
             newRecorder.delegate = self
@@ -176,6 +179,11 @@ final class RecordingPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        DispatchQueue.main.async { self.stop() }
+        DispatchQueue.main.async {
+            // One last tick right at the end, in case periodic timer ticks (every 0.15s) landed just short of a
+            // stroke drawn in the final moment of the recording and never caught it.
+            if let id = self.playingID { self.onTick?(id, player.duration) }
+            self.stop()
+        }
     }
 }

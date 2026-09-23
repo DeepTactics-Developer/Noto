@@ -27,4 +27,21 @@ final class AIAssistantTests: XCTestCase {
         let index = DocumentTextIndex(pages: ["가", "나", "다", "라"])
         XCTAssertEqual(index.relevantPages(to: "없는단어", limit: 2), [0, 1])
     }
+
+    private struct StubError: LocalizedError {
+        var errorDescription: String?
+    }
+
+    // Matched against the real strings FoundationModels has been observed to produce on a device.
+    func testFriendlyErrorMessageRecognizesKnownFailures() {
+        XCTAssertTrue(AIErrorMessage.friendly(for: StubError(errorDescription: "Exceeded model context window size")).contains("너무 길어"))
+        XCTAssertTrue(AIErrorMessage.friendly(for: StubError(errorDescription: "Detected content likely to be unsafe")).contains("처리할 수 없다"))
+        let other = StubError(errorDescription: "Some other failure")
+        XCTAssertEqual(AIErrorMessage.friendly(for: other), "Some other failure") // unrecognized: pass the raw message through
+    }
+
+    func testIsContextWindowErrorOnlyMatchesThatFailure() {
+        XCTAssertTrue(AIErrorMessage.isContextWindowError(StubError(errorDescription: "Exceeded model context window size")))
+        XCTAssertFalse(AIErrorMessage.isContextWindowError(StubError(errorDescription: "Detected content likely to be unsafe")))
+    }
 }

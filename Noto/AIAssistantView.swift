@@ -6,10 +6,13 @@ private struct AIMessage: Identifiable {
     let question: String
     var answer: String
     var isError = false
+    var isCached = false // shows a "다시 생성" button instead of just sitting there
+    var regenerate: (() -> Void)?
 }
 
 struct AIAssistantView: View {
     let document: PDFDocument
+    let folder: DocumentFolder
     let onJumpToPage: (Int) -> Void
     // Set when opened from the lasso's "AI로 설명" instead of the toolbar AI icon: the gathered PDF text +
     // recognized handwriting from inside the selection, explained automatically as soon as the sheet appears.
@@ -68,9 +71,6 @@ struct AIAssistantView: View {
                             questionBubble(message.question).id(message.id)
                             answerBubble(message)
                         }
-                        if loading {
-                            HStack { ProgressView(); Spacer() }.padding(.leading, 4)
-                        }
                     }
                     .padding(16)
                 }
@@ -80,8 +80,8 @@ struct AIAssistantView: View {
             }
             Divider()
             HStack(spacing: 10) {
-                Button("요약") { Task { await summarize() } }.buttonStyle(.bordered).disabled(loading)
-                Button("목차 생성") { Task { await generateOutline() } }.buttonStyle(.bordered).disabled(loading)
+                Button("요약") { Task { await summarize(forceRefresh: false) } }.buttonStyle(.bordered).disabled(loading)
+                Button("목차 생성") { Task { await generateOutline(forceRefresh: false) } }.buttonStyle(.bordered).disabled(loading)
             }
             .padding(.horizontal, 12)
             .padding(.top, 8)
@@ -112,7 +112,8 @@ struct AIAssistantView: View {
         } message: { Text($0) }
     }
 
-    // The user's own question: a right-aligned bubble, like an outgoing message.
+    // The user's own question: a right-aligned bubble, like an outgoing message. Appended immediately (see
+    // appendPlaceholder below) so this shows the moment a question is sent, not only once the answer arrives.
     private func questionBubble(_ text: String) -> some View {
         HStack {
             Spacer(minLength: 40)
@@ -125,15 +126,25 @@ struct AIAssistantView: View {
         }
     }
 
-    // The AI's answer: a left-aligned bubble, like an incoming message.
+    // The AI's answer: a left-aligned bubble, like an incoming message. Empty while still loading (a spinner
+    // shows instead), and cached summary/outline results get a small "다시 생성" button of their own.
     private func answerBubble(_ message: AIMessage) -> some View {
         HStack {
-            citedText(message.answer)
-                .font(.subheadline)
-                .foregroundStyle(message.isError ? Color.red : Color.primary)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+            VStack(alignment: .leading, spacing: 6) {
+                if message.answer.isEmpty {
+                    ProgressView()
+                } else {
+                    citedText(message.answer)
+                        .font(.subheadline)
+                        .foregroundStyle(message.isError ? Color.red : Color.primary)
+                }
+                if message.isCached, let regenerate = message.regenerate {
+                    Button("↻ 다시 생성", action: regenerate).font(.caption)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
             Spacer(minLength: 40)
         }
     }
@@ -159,9 +170,26 @@ struct AIAssistantView: View {
         }
     }
 
+    // Shows the question right away with an empty (spinner) answer, and returns its id to fill in once the
+    // real answer (or an error) is ready.
+    private func appendPlaceholder(_ question: String) -> UUID {
+        let message = AIMessage(question: question, answer: "")
+        messages.append(message)
+        return message.id
+    }
+
+    private func update(_ id: UUID, answer: String, isError: Bool = false, isCached: Bool = false, regenerate: (() -> Void)? = nil) {
+        guard let i = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[i].answer = answer
+        messages[i].isError = isError
+        messages[i].isCached = isCached
+        messages[i].regenerate = regenerate
+    }
+
     private func explainSelection(_ content: String) async {
+        let id = appendPlaceholder("선택한 내용 설명")
         guard !content.trimmingCharacters(in: .whitespaces).isEmpty else {
-            messages.append(AIMessage(question: "선택한 내용 설명", answer: "선택 영역에서 텍스트나 필기를 인식하지 못했습니다.", isError: true))
+            update(id, answer: "선택 영역에서 텍스트나 필기를 인식하지 못했습니다.", isError: true)
             return
         }
         loading = true
@@ -170,70 +198,92 @@ struct AIAssistantView: View {
         if #available(iOS 26.0, *) {
             do {
                 let answer = try await AIAssistant.explainSelection(content)
-                messages.append(AIMessage(question: "선택한 내용 설명", answer: answer))
+                update(id, answer: answer)
             } catch {
-                messages.append(AIMessage(question: "선택한 내용 설명", answer: "설명하지 못했습니다: \(error.localizedDescription)", isError: true))
+                update(id, answer: AIErrorMessage.friendly(for: error), isError: true)
             }
             return
         }
         #endif
-        messages.append(AIMessage(question: "선택한 내용 설명", answer: "이 빌드에서는 AI 기능을 사용할 수 없습니다.", isError: true))
+        update(id, answer: "이 빌드에서는 AI 기능을 사용할 수 없습니다.", isError: true)
     }
 
     private func ask() async {
         let question = question.trimmingCharacters(in: .whitespaces)
         guard !question.isEmpty, let index else { return }
         self.question = ""
+        let id = appendPlaceholder(question)
         loading = true
         defer { loading = false }
         #if canImport(FoundationModels)
         if #available(iOS 26.0, *) {
             do {
                 let answer = try await AIAssistant.answer(question: question, index: index)
-                messages.append(AIMessage(question: question, answer: answer))
+                update(id, answer: answer)
             } catch {
-                messages.append(AIMessage(question: question, answer: "답변을 가져오지 못했습니다: \(error.localizedDescription)", isError: true))
+                update(id, answer: AIErrorMessage.friendly(for: error), isError: true)
             }
             return
         }
         #endif
-        messages.append(AIMessage(question: question, answer: "이 빌드에서는 AI 기능을 사용할 수 없습니다.", isError: true))
+        update(id, answer: "이 빌드에서는 AI 기능을 사용할 수 없습니다.", isError: true)
     }
 
-    private func summarize() async {
+    private func summarize(forceRefresh: Bool) async {
         guard let index else { return }
+        if !forceRefresh, let cached = AICacheStore.summary(for: folder) {
+            let id = appendPlaceholder("요약")
+            update(id, answer: cached, isCached: true) { Task { await self.summarize(forceRefresh: true) } }
+            return
+        }
+        let id = appendPlaceholder("요약")
         loading = true
         defer { loading = false }
         #if canImport(FoundationModels)
         if #available(iOS 26.0, *) {
             do {
                 let answer = try await AIAssistant.summarize(index: index)
-                messages.append(AIMessage(question: "요약", answer: answer))
+                AICacheStore.setSummary(answer, for: folder)
+                update(id, answer: answer, isCached: true) { Task { await self.summarize(forceRefresh: true) } }
             } catch {
-                messages.append(AIMessage(question: "요약", answer: "요약하지 못했습니다: \(error.localizedDescription)", isError: true))
+                update(id, answer: AIErrorMessage.friendly(for: error), isError: true)
             }
             return
         }
         #endif
-        messages.append(AIMessage(question: "요약", answer: "이 빌드에서는 AI 기능을 사용할 수 없습니다.", isError: true))
+        update(id, answer: "이 빌드에서는 AI 기능을 사용할 수 없습니다.", isError: true)
     }
 
-    private func generateOutline() async {
+    private func generateOutline(forceRefresh: Bool) async {
         guard let index else { return }
+        if !forceRefresh, let cached = AICacheStore.outline(for: folder) {
+            let id = appendPlaceholder("목차 생성")
+            update(id, answer: formatOutline(cached), isCached: true) { Task { await self.generateOutline(forceRefresh: true) } }
+            return
+        }
+        let id = appendPlaceholder("목차 생성")
         loading = true
         defer { loading = false }
         #if canImport(FoundationModels)
         if #available(iOS 26.0, *) {
             do {
                 let items = try await AIAssistant.outline(index: index)
-                let text = items.isEmpty ? "목차를 만들지 못했습니다." : items.map { "\($0.title) (p.\($0.page + 1))" }.joined(separator: "\n")
-                messages.append(AIMessage(question: "목차 생성", answer: text))
+                guard !items.isEmpty else {
+                    update(id, answer: "목차를 만들지 못했습니다.", isError: true)
+                    return
+                }
+                AICacheStore.setOutline(items, for: folder)
+                update(id, answer: formatOutline(items), isCached: true) { Task { await self.generateOutline(forceRefresh: true) } }
             } catch {
-                messages.append(AIMessage(question: "목차 생성", answer: "목차를 만들지 못했습니다: \(error.localizedDescription)", isError: true))
+                update(id, answer: AIErrorMessage.friendly(for: error), isError: true)
             }
             return
         }
         #endif
-        messages.append(AIMessage(question: "목차 생성", answer: "이 빌드에서는 AI 기능을 사용할 수 없습니다.", isError: true))
+        update(id, answer: "이 빌드에서는 AI 기능을 사용할 수 없습니다.", isError: true)
+    }
+
+    private func formatOutline(_ items: [(title: String, page: Int)]) -> String {
+        items.map { "\($0.title) (p.\($0.page + 1))" }.joined(separator: "\n")
     }
 }

@@ -24,6 +24,8 @@ enum AppSettings {
         static let eraserMode = "eraserMode"
         static let eraserSize = "eraserSize"
         static let highlighterTextSnap = "highlighterTextSnap"
+        static let audioSyncAutoScroll = "audioSyncAutoScroll"
+        static let audioSyncHighlight = "audioSyncHighlight"
     }
 
     static var shapeSnap: Bool { UserDefaults.standard.object(forKey: Key.shapeSnap) as? Bool ?? true }
@@ -33,6 +35,8 @@ enum AppSettings {
     static var eraserMode: EraserMode { EraserMode(rawValue: UserDefaults.standard.string(forKey: Key.eraserMode) ?? "") ?? .partial }
     static var eraserSize: Double { UserDefaults.standard.object(forKey: Key.eraserSize) as? Double ?? 12 } // radius in screen points
     static var highlighterTextSnap: Bool { UserDefaults.standard.object(forKey: Key.highlighterTextSnap) as? Bool ?? true }
+    static var audioSyncAutoScroll: Bool { UserDefaults.standard.object(forKey: Key.audioSyncAutoScroll) as? Bool ?? true }
+    static var audioSyncHighlight: Bool { UserDefaults.standard.object(forKey: Key.audioSyncHighlight) as? Bool ?? true }
 }
 
 struct SettingsView: View {
@@ -43,6 +47,8 @@ struct SettingsView: View {
     @AppStorage(AppSettings.Key.holdDelay) private var holdDelay = 0.5
     @AppStorage(AppSettings.Key.eraserMode) private var eraser = EraserMode.partial.rawValue
     @AppStorage(AppSettings.Key.highlighterTextSnap) private var highlighterTextSnap = true
+    @AppStorage(AppSettings.Key.audioSyncAutoScroll) private var audioSyncAutoScroll = true
+    @AppStorage(AppSettings.Key.audioSyncHighlight) private var audioSyncHighlight = true
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -79,6 +85,15 @@ struct SettingsView: View {
                     Text("형광펜")
                 } footer: {
                     Text("텍스트가 있는 PDF(스캔본은 OCR이 된 경우)에서 줄 위를 대충 그어도 그 줄 전체에 깔끔하게 맞춰 그어집니다. 텍스트가 없는 페이지에서는 손으로 그린 그대로 그어집니다.")
+                }
+
+                Section {
+                    Toggle("재생 중 페이지 자동 이동", isOn: $audioSyncAutoScroll)
+                    Toggle("재생 중 필기 하이라이트", isOn: $audioSyncHighlight)
+                } header: {
+                    Text("녹음 재생")
+                } footer: {
+                    Text("녹음을 재생하면 그 시점에 쓰던 필기를 표시합니다. 다른 페이지에 있을 때 자동으로 이동할지, 필기를 강조 표시할지 각각 켜고 끌 수 있습니다.")
                 }
 
                 Section {
