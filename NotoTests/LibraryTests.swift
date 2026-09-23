@@ -103,4 +103,45 @@ final class LibraryTests: XCTestCase {
         XCTAssertEqual(doc.pageCount, 1)
         XCTAssertEqual(Library.all().map(\.title), ["빈 노트"])
     }
+
+    func testTrashingRemovesFromLibraryAndListsInTrash() throws {
+        let doc = try Library.createBlank(title: "노트")
+        Library.trash(doc)
+        XCTAssertTrue(Library.all().isEmpty)
+        XCTAssertEqual(Library.trashedDocuments().map(\.title), ["노트"])
+        XCTAssertNotNil(Library.trashedDocuments().first?.deletedAt)
+    }
+
+    func testRestoringATrashedDocumentBringsItBack() throws {
+        let doc = try Library.createBlank(title: "노트")
+        Library.trash(doc)
+        let trashed = try XCTUnwrap(Library.trashedDocuments().first)
+        Library.restore(trashed)
+        XCTAssertTrue(Library.trashedDocuments().isEmpty)
+        XCTAssertEqual(Library.all().map(\.title), ["노트"])
+        XCTAssertNil(Library.all().first?.deletedAt)
+    }
+
+    func testPermanentlyDeletingATrashedDocumentRemovesTheFolder() throws {
+        let doc = try Library.createBlank(title: "노트")
+        Library.trash(doc)
+        let trashed = try XCTUnwrap(Library.trashedDocuments().first)
+        Library.permanentlyDelete(trashed)
+        XCTAssertTrue(Library.trashedDocuments().isEmpty)
+    }
+
+    // purgeExpiredTrash only removes documents whose deletedAt is old enough — a document trashed moments ago
+    // must survive the sweep.
+    func testPurgeExpiredTrashOnlyRemovesOldEntries() throws {
+        let fresh = try Library.createBlank(title: "최근 삭제")
+        Library.trash(fresh)
+        let old = try Library.createBlank(title: "오래된 삭제")
+        Library.trash(old)
+        var oldMeta = DocumentMeta.load(from: Library.trashedDocuments().first { $0.title == "오래된 삭제" }!.url)
+        oldMeta.deletedAt = Date.now.addingTimeInterval(-Double(Library.trashLifetimeDays + 1) * 24 * 60 * 60)
+        try oldMeta.save(to: Library.trashedDocuments().first { $0.title == "오래된 삭제" }!.url)
+
+        Library.purgeExpiredTrash()
+        XCTAssertEqual(Library.trashedDocuments().map(\.title), ["최근 삭제"])
+    }
 }

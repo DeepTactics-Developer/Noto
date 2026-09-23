@@ -2,13 +2,14 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum LibraryFilter: Hashable {
-    case recent, all, favorites, subject(UUID)
+    case recent, all, favorites, trash, subject(UUID)
 }
 
 struct LibraryView: View {
     let onOpen: (DocumentFolder) -> Void
 
     @State private var documents: [DocumentFolder] = []
+    @State private var trashedDocuments: [DocumentFolder] = []
     @State private var subjects: [Subject] = []
     @State private var filter: LibraryFilter? = .recent
     @State private var searchText = ""
@@ -17,15 +18,21 @@ struct LibraryView: View {
     @State private var showingAddSubject = false
     @State private var newSubjectName = ""
     @State private var pendingDelete: DocumentFolder?
+    @State private var pendingPermanentDelete: DocumentFolder?
     @State private var errorText: String?
 
     private var filtered: [DocumentFolder] {
+        if filter == .trash {
+            guard !searchText.isEmpty else { return trashedDocuments }
+            return trashedDocuments.filter { $0.title.localizedCaseInsensitiveContains(searchText) }
+        }
         var list = documents
         switch filter {
         case .recent, nil: list = Array(list.prefix(20))
         case .all: break
         case .favorites: list = list.filter(\.favorite)
         case .subject(let id): list = list.filter { $0.subjectID == id }
+        case .trash: break // handled above
         }
         guard !searchText.isEmpty else { return list }
         return list.filter { $0.title.localizedCaseInsensitiveContains(searchText) }
@@ -38,6 +45,7 @@ struct LibraryView: View {
                     Label("최근", systemImage: "clock").tag(LibraryFilter.recent)
                     Label("모든 문서", systemImage: "doc.on.doc").tag(LibraryFilter.all)
                     Label("즐겨찾기", systemImage: "star").tag(LibraryFilter.favorites)
+                    Label("휴지통", systemImage: "trash").tag(LibraryFilter.trash)
                 }
                 Section("과목") {
                     ForEach(subjects) { subject in
@@ -57,7 +65,10 @@ struct LibraryView: View {
         } detail: {
             content
         }
-        .onAppear(perform: reload)
+        .onAppear {
+            Library.purgeExpiredTrash()
+            reload()
+        }
         .sheet(isPresented: $showingSettings) { SettingsView() }
         .alert("새 과목", isPresented: $showingAddSubject) {
             TextField("과목 이름", text: $newSubjectName)
@@ -81,11 +92,21 @@ struct LibraryView: View {
         .confirmationDialog("문서를 삭제할까요?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
                             titleVisibility: .visible, presenting: pendingDelete) { document in
             Button("삭제", role: .destructive) {
-                Library.delete(document)
+                Library.trash(document)
                 reload()
             }
         } message: { _ in
-            Text("필기도 함께 삭제되며 되돌릴 수 없습니다.")
+            Text("휴지통으로 이동합니다. \(Library.trashLifetimeDays)일 후 자동으로 완전히 삭제됩니다.")
+        }
+        .confirmationDialog("완전히 삭제할까요?",
+                            isPresented: Binding(get: { pendingPermanentDelete != nil }, set: { if !$0 { pendingPermanentDelete = nil } }),
+                            titleVisibility: .visible, presenting: pendingPermanentDelete) { document in
+            Button("완전히 삭제", role: .destructive) {
+                Library.permanentlyDelete(document)
+                reload()
+            }
+        } message: { _ in
+            Text("필기를 포함해 모든 내용이 영구히 삭제되며 되돌릴 수 없습니다.")
         }
         .alert("문제가 발생했습니다", isPresented: Binding(get: { errorText != nil }, set: { if !$0 { errorText = nil } })) {
             Button("확인", role: .cancel) {}
@@ -102,7 +123,7 @@ struct LibraryView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 160, maximum: 220), spacing: 16)], spacing: 20) {
                     ForEach(filtered) { document in
                         DocumentCard(document: document, subject: subjects.first { $0.id == document.subjectID })
-                            .onTapGesture { onOpen(document) }
+                            .onTapGesture { if filter != .trash { onOpen(document) } } // restore before reopening
                             .contextMenu { cardMenu(for: document) }
                     }
                 }
@@ -129,9 +150,11 @@ struct LibraryView: View {
 
     private var emptyState: some View {
         VStack(spacing: 8) {
-            Image(systemName: "doc.text").font(.system(size: 40)).foregroundStyle(.tertiary)
-            Text("문서가 없습니다").font(.headline)
-            Text("PDF를 가져오거나 빈 노트를 만들어 시작하세요.").font(.subheadline).foregroundStyle(.secondary)
+            Image(systemName: filter == .trash ? "trash" : "doc.text").font(.system(size: 40)).foregroundStyle(.tertiary)
+            Text(filter == .trash ? "휴지통이 비어 있습니다" : "문서가 없습니다").font(.headline)
+            if filter != .trash {
+                Text("PDF를 가져오거나 빈 노트를 만들어 시작하세요.").font(.subheadline).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -140,26 +163,39 @@ struct LibraryView: View {
         case .recent, nil: "최근"
         case .all: "모든 문서"
         case .favorites: "즐겨찾기"
+        case .trash: "휴지통"
         case .subject(let id): subjects.first { $0.id == id }?.name ?? "과목"
         }
     }
 
     @ViewBuilder
     private func cardMenu(for document: DocumentFolder) -> some View {
-        Button {
-            Library.setFavorite(!document.favorite, for: document)
-            reload()
-        } label: {
-            Label(document.favorite ? "즐겨찾기 해제" : "즐겨찾기", systemImage: document.favorite ? "star.slash" : "star")
-        }
-        Menu("과목 지정") {
-            Button("없음") { Library.setSubject(nil, for: document); reload() }
-            ForEach(subjects) { subject in
-                Button(subject.name) { Library.setSubject(subject.id, for: document); reload() }
+        if filter == .trash {
+            Button {
+                Library.restore(document)
+                reload()
+            } label: {
+                Label("복원", systemImage: "arrow.uturn.backward")
             }
-        }
-        Button(role: .destructive) { pendingDelete = document } label: {
-            Label("삭제", systemImage: "trash")
+            Button(role: .destructive) { pendingPermanentDelete = document } label: {
+                Label("완전히 삭제", systemImage: "trash.slash")
+            }
+        } else {
+            Button {
+                Library.setFavorite(!document.favorite, for: document)
+                reload()
+            } label: {
+                Label(document.favorite ? "즐겨찾기 해제" : "즐겨찾기", systemImage: document.favorite ? "star.slash" : "star")
+            }
+            Menu("과목 지정") {
+                Button("없음") { Library.setSubject(nil, for: document); reload() }
+                ForEach(subjects) { subject in
+                    Button(subject.name) { Library.setSubject(subject.id, for: document); reload() }
+                }
+            }
+            Button(role: .destructive) { pendingDelete = document } label: {
+                Label("삭제", systemImage: "trash")
+            }
         }
     }
 
@@ -176,6 +212,7 @@ struct LibraryView: View {
 
     private func reload() {
         documents = Library.all()
+        trashedDocuments = Library.trashedDocuments()
         subjects = SubjectStore.all()
     }
 }
@@ -202,10 +239,17 @@ private struct DocumentCard: View {
                 if let subject {
                     Circle().fill(subject.color).frame(width: 6, height: 6)
                 }
-                Text("\(document.pageCount)쪽 · \(document.modified.formatted(.dateTime.month().day()))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+
+    // In the trash, how long until it's gone for good matters more than when it was last edited.
+    private var subtitle: String {
+        guard let deletedAt = document.deletedAt else {
+            return "\(document.pageCount)쪽 · \(document.modified.formatted(.dateTime.month().day()))"
+        }
+        let daysLeft = Library.trashLifetimeDays - Calendar.current.dateComponents([.day], from: deletedAt, to: .now).day!
+        return daysLeft > 0 ? "\(daysLeft)일 후 자동 삭제" : "곧 자동 삭제됨"
     }
 }

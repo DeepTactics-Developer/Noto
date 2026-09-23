@@ -12,6 +12,7 @@ struct DocumentFolder: Identifiable, Hashable {
     let pageCount: Int
     let subjectID: UUID?
     let favorite: Bool
+    let deletedAt: Date? // set only while sitting in the trash
 
     var id: String { url.lastPathComponent }
     var pdfURL: URL { url.appending(path: "source.pdf") }
@@ -38,17 +39,19 @@ struct DocumentMeta: Codable {
     var subjectID: UUID?
     var favorite: Bool = false
     var bookmarkedPages: Set<Int> = []
+    var deletedAt: Date? // set only while the document sits in the trash
 
-    init(title: String, subjectID: UUID? = nil, favorite: Bool = false, bookmarkedPages: Set<Int> = []) {
+    init(title: String, subjectID: UUID? = nil, favorite: Bool = false, bookmarkedPages: Set<Int> = [], deletedAt: Date? = nil) {
         self.title = title
         self.subjectID = subjectID
         self.favorite = favorite
         self.bookmarkedPages = bookmarkedPages
+        self.deletedAt = deletedAt
     }
 
     // Custom decode so a meta.json saved by an older build of the app (missing a field added since) still opens,
     // the same way the fallback to title.txt below handles files from before meta.json existed at all.
-    private enum CodingKeys: String, CodingKey { case title, subjectID, favorite, bookmarkedPages }
+    private enum CodingKeys: String, CodingKey { case title, subjectID, favorite, bookmarkedPages, deletedAt }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -56,6 +59,7 @@ struct DocumentMeta: Codable {
         subjectID = try container.decodeIfPresent(UUID.self, forKey: .subjectID)
         favorite = try container.decodeIfPresent(Bool.self, forKey: .favorite) ?? false
         bookmarkedPages = try container.decodeIfPresent(Set<Int>.self, forKey: .bookmarkedPages) ?? []
+        deletedAt = try container.decodeIfPresent(Date.self, forKey: .deletedAt)
     }
 
     static func load(from folder: URL) -> DocumentMeta {
@@ -118,10 +122,17 @@ enum SubjectStore {
 
 enum Library {
     static var root: URL = .documentsDirectory // overridden by tests
+    private static var trashRoot: URL { root.appending(path: "Trash", directoryHint: .isDirectory) }
+    static let trashLifetimeDays = 30
+    private static var trashLifetime: TimeInterval { TimeInterval(trashLifetimeDays) * 24 * 60 * 60 }
 
     static func all() -> [DocumentFolder] {
+        documents(in: root)
+    }
+
+    private static func documents(in directory: URL) -> [DocumentFolder] {
         let fm = FileManager.default
-        let items = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
+        let items = (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
         return items.compactMap { url -> DocumentFolder? in
             let pdfURL = url.appending(path: "source.pdf")
             guard fm.fileExists(atPath: pdfURL.path) else { return nil }
@@ -129,7 +140,7 @@ enum Library {
             let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let pageCount = CGPDFDocument(pdfURL as CFURL)?.numberOfPages ?? 0
             return DocumentFolder(url: url, title: meta.title, modified: modified, pageCount: pageCount,
-                                  subjectID: meta.subjectID, favorite: meta.favorite)
+                                  subjectID: meta.subjectID, favorite: meta.favorite, deletedAt: meta.deletedAt)
         }
         .sorted { $0.modified > $1.modified }
     }
@@ -147,7 +158,7 @@ enum Library {
             try fm.copyItem(at: source, to: pdf)
             guard let pages = PDFDocument(url: pdf)?.cgPages else { throw NotAPDF() }
             try DocumentMeta(title: title).save(to: folder)
-            return DocumentFolder(url: folder, title: title, modified: .now, pageCount: pages.count, subjectID: nil, favorite: false)
+            return DocumentFolder(url: folder, title: title, modified: .now, pageCount: pages.count, subjectID: nil, favorite: false, deletedAt: nil)
         } catch {
             try? fm.removeItem(at: folder)
             throw error
@@ -171,11 +182,43 @@ enum Library {
             try? fm.removeItem(at: folder)
             throw error
         }
-        return DocumentFolder(url: folder, title: title, modified: .now, pageCount: 1, subjectID: nil, favorite: false)
+        return DocumentFolder(url: folder, title: title, modified: .now, pageCount: 1, subjectID: nil, favorite: false, deletedAt: nil)
     }
 
-    static func delete(_ document: DocumentFolder) {
+    // Moves the document into the Trash folder instead of deleting it outright — recoverable via restore(_:),
+    // or gone for good once purgeExpiredTrash() sweeps it after 30 days (or via permanentlyDelete(_:) sooner).
+    static func trash(_ document: DocumentFolder) {
+        var meta = DocumentMeta.load(from: document.url)
+        meta.deletedAt = .now
+        try? meta.save(to: document.url)
+        let fm = FileManager.default
+        try? fm.createDirectory(at: trashRoot, withIntermediateDirectories: true)
+        try? fm.moveItem(at: document.url, to: trashRoot.appending(path: document.id, directoryHint: .isDirectory))
+    }
+
+    static func restore(_ document: DocumentFolder) {
+        var meta = DocumentMeta.load(from: document.url)
+        meta.deletedAt = nil
+        try? meta.save(to: document.url)
+        try? FileManager.default.moveItem(at: document.url, to: root.appending(path: document.id, directoryHint: .isDirectory))
+    }
+
+    static func permanentlyDelete(_ document: DocumentFolder) {
         try? FileManager.default.removeItem(at: document.url)
+    }
+
+    static func trashedDocuments() -> [DocumentFolder] {
+        documents(in: trashRoot)
+    }
+
+    // Called once when the library loads — anything trashed more than 30 days ago is removed for good.
+    static func purgeExpiredTrash() {
+        let cutoff = Date.now.addingTimeInterval(-trashLifetime)
+        for document in trashedDocuments() {
+            if let deletedAt = document.deletedAt, deletedAt < cutoff {
+                permanentlyDelete(document)
+            }
+        }
     }
 
     static func setFavorite(_ favorite: Bool, for document: DocumentFolder) {
